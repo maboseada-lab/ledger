@@ -527,6 +527,8 @@ async function save(force){
     await saveChunked(database, 'salesOrders', state.salesOrders, INVOICES_CHUNK);
     await saveChunked(database, 'salesReturns', state.salesReturns, INVOICES_CHUNK);
     await saveChunked(database, 'stockMoves', state.stockMoves||[], ENTRIES_CHUNK);
+    await saveChunked(database, 'vouchers', state.vouchers||[], INVOICES_CHUNK);
+    await saveChunked(database, 'notices', state.notices||[], INVOICES_CHUNK);
     await saveChunked(database, 'productions', state.productions||[], INVOICES_CHUNK);
     await saveChunked(database, 'stocktakes', state.stocktakes||[], INVOICES_CHUNK);
     await saveChunked(database, 'purchaseReturns', state.purchaseReturns||[], INVOICES_CHUNK);
@@ -581,6 +583,8 @@ async function load(){
     state.salesOrders = await loadChunked(database, 'salesOrders');
     state.salesReturns = await loadChunked(database, 'salesReturns');
     state.stockMoves = await loadChunked(database, 'stockMoves');
+    state.vouchers = await loadChunked(database, 'vouchers');
+    state.notices = await loadChunked(database, 'notices');
     state.productions = await loadChunked(database, 'productions');
     state.stocktakes = await loadChunked(database, 'stocktakes');
     state.purchaseReturns = await loadChunked(database, 'purchaseReturns');
@@ -3286,7 +3290,8 @@ const KINDS = {
   raw:  {label:'خامة',               acc:'114001', wh:'wh_raw'},
   pack: {label:'مواد تعبئة وتغليف',  acc:'114002', wh:'wh_pack'},
   semi: {label:'نصف مصنع',           acc:'114004', wh:'wh_raw'},
-  fg:   {label:'منتج تام',           acc:'114003', wh:'wh_fg'}
+  fg:   {label:'منتج تام',           acc:'114003', wh:'wh_fg'},
+  tool: {label:'أدوات ومستهلكات',    acc:'114005', wh:'wh_tools'}
 };
 const KIND_OPTS = [['none','غير مخزني (بدون تتبع)'],['raw','خامة'],['pack','مواد تعبئة وتغليف'],['semi','نصف مصنع'],['fg','منتج تام']];
 function sel(id, opts, val, extra){
@@ -3310,9 +3315,10 @@ function defaultWarehouses(){
   ];
 }
 function ensureState(){
-  ['stockMoves','recipes','productions','stocktakes','purchaseReturns','contacts','schedules'].forEach(k=>{ if(!Array.isArray(state[k])) state[k] = []; });
+  ['stockMoves','vouchers','notices','recipes','productions','stocktakes','purchaseReturns','contacts','schedules'].forEach(k=>{ if(!Array.isArray(state[k])) state[k] = []; });
   if(!Array.isArray(state.warehouses) || !state.warehouses.length) state.warehouses = defaultWarehouses();
   if(!state.counters) state.counters = {entry:0, sale:0, purchase:0};
+  setupWarehouses28();
 }
 function whById(id){ return state.warehouses.find(w=>w.id===id); }
 function whName(id){ const w = whById(id); return w ? w.name : '—'; }
@@ -3326,7 +3332,7 @@ function unitOf(p){ return (p && p.unit) || ''; }
 function ensureStockAccounts(){
   const need = [
     ['114001','مخزون خامات','asset'], ['114002','مخزون مواد تعبئة وتغليف','asset'],
-    ['114003','مخزون منتج تام','asset'], ['114004','مخزون نصف مصنع','asset'],
+    ['114003','مخزون منتج تام','asset'], ['114004','مخزون نصف مصنع','asset'], ['114005','مخزون أدوات ومستهلكات','asset'],
     ['530030','تكلفة البضاعة المباعة','expense'], ['540007','عجز وزيادة جرد المخزون','expense']
   ];
   need.forEach(([code,name,type])=>{ if(!accountByCode(code)) state.accounts.push({code,name,type}); });
@@ -3336,14 +3342,17 @@ function ensureStockAccounts(){
 function sidx(){
   const ix = {};
   for(const m of state.stockMoves){
-    const o = ix[m.itemId] || (ix[m.itemId] = {q:0, v:0, last:0, wh:{}});
-    o.q += m.qty; o.v += m.qty*m.unitCost;
-    if(m.qty>0 && m.unitCost>0) o.last = m.unitCost;
-    o.wh[m.whId] = (o.wh[m.whId]||0) + m.qty;
+    const o = ix[m.itemId] || (ix[m.itemId] = {q:0, vq:0, v:0, last:0, wh:{}, b:{}});
+    if(m.ph!==false){
+      o.q += m.qty; o.wh[m.whId] = (o.wh[m.whId]||0) + m.qty;
+      const k = m.whId+'|'+(m.batch||'')+'|'+(m.pd||'');
+      const b = o.b[k] || (o.b[k] = {wh:m.whId, batch:m.batch||'', pd:m.pd||'', q:0}); b.q += m.qty;
+    }
+    if(m.va!==false){ o.vq += m.qty; o.v += m.qty*m.unitCost; if(m.qty>0 && m.unitCost>0) o.last = m.unitCost; }
   }
   return ix;
 }
-function avgOf(o){ if(!o) return 0; return o.q>1e-9 ? o.v/o.q : o.last; }
+function avgOf(o){ if(!o) return 0; return o.vq>1e-9 ? o.v/o.vq : o.last; }
 function avgCost(itemId, ix){ return avgOf((ix||sidx())[itemId]); }
 function addMove(o){
   const m = Object.assign({id:uid(), qty:0, unitCost:0}, o);
@@ -3390,7 +3399,7 @@ function postPurchaseStock(inv){
   rows.forEach(({it,p})=>{
     const a = KINDS[p.kind].acc;
     byAcc[a] = (byAcc[a]||0) + it.total; tot += it.total;
-    addMove({date:inv.date, type:'in', itemId:p.id, whId:itemWh(p), qty:it.qty, unitCost:(it.qty? it.total/it.qty : 0), refType:'purchase', refId:inv.id, note:'فاتورة مشتريات #'+inv.ref});
+    addMove({ph:false, date:inv.date, type:'in', itemId:p.id, whId:itemWh(p), qty:it.qty, unitCost:(it.qty? it.total/it.qty : 0), refType:'purchase', refId:inv.id, note:'فاتورة مشتريات #'+inv.ref});
   });
   const dl = entry.lines.find(l=>l.code===inv.debitCode && l.debit>0);
   if(dl) dl.debit = r2(dl.debit - tot);
@@ -3405,12 +3414,12 @@ function postSaleStock(inv){
   if(!rows.length) return [];
   const ix = sidx(), warns = [], cost = {}; let totalCost = 0;
   rows.forEach(({it,p})=>{
-    const o = ix[p.id], avg = avgOf(o), have = o ? o.q : 0;
+    const o = ix[p.id], avg = avgOf(o), have = o ? o.vq : 0;
     if(have < it.qty - 1e-9) warns.push(`رصيد "${p.name}" ${fmt(have)} أقل من المباع ${fmt(it.qty)}`);
     if(!(avg>0)) warns.push(`"${p.name}" ملوش تكلفة مسجلة (ادخل رصيد افتتاحي أو إنتاج)`);
-    addMove({date:inv.date, type:'out', itemId:p.id, whId:itemWh(p), qty:-it.qty, unitCost:avg, refType:'sale', refId:inv.id, note:'فاتورة مبيعات #'+inv.ref});
+    addMove({ph:false, date:inv.date, type:'out', itemId:p.id, whId:itemWh(p), qty:-it.qty, unitCost:avg, refType:'sale', refId:inv.id, note:'فاتورة مبيعات #'+inv.ref});
     const v = r2(it.qty*avg); if(v>0){ const a = KINDS[p.kind].acc; cost[a] = (cost[a]||0)+v; totalCost += v; }
-    if(o){ o.q -= it.qty; o.v -= it.qty*avg; }
+    if(o){ o.vq -= it.qty; o.v -= it.qty*avg; }
   });
   if(totalCost>0){
     const e = mkEntry(inv.date, `تكلفة مبيعات فاتورة #${inv.ref} — ${inv.customerName}`,
@@ -3915,12 +3924,12 @@ function saveReturn(kind){
     const p = trackedByName(it.item); if(!p) return;
     if(sale){
       const avg = avgCost(p.id, ix);
-      addMove({date:d.date, type:'in', itemId:p.id, whId:itemWh(p), qty:it.qty, unitCost:avg, refType:'saleReturn', refId:id, note:'مرتجع مبيعات '+ref});
+      addMove({ph:false, date:d.date, type:'in', itemId:p.id, whId:itemWh(p), qty:it.qty, unitCost:avg, refType:'saleReturn', refId:id, note:'مرتجع مبيعات '+ref});
       const v = r2(it.qty*avg); if(v>0){ const a = KINDS[p.kind].acc; cogs[a] = (cogs[a]||0)+v; cogsTotal += v; }
     } else {
-      const o = ix[p.id], have = o?o.q:0;
+      const o = ix[p.id], have = o?o.vq:0;
       if(have < it.qty-1e-9) toast(`⚠️ رصيد "${p.name}" ${fmt(have)} أقل من المرتجع`, true);
-      addMove({date:d.date, type:'out', itemId:p.id, whId:itemWh(p), qty:-it.qty, unitCost:it.price, refType:'purchaseReturn', refId:id, note:'مرتجع مشتريات '+ref});
+      addMove({ph:false, date:d.date, type:'out', itemId:p.id, whId:itemWh(p), qty:-it.qty, unitCost:it.price, refType:'purchaseReturn', refId:id, note:'مرتجع مشتريات '+ref});
       const a = KINDS[p.kind].acc; invCr[a] = (invCr[a]||0)+it.total; trackedTotal += it.total;
     }
   });
@@ -4008,7 +4017,7 @@ const MODULES = {
   purchases: {label:'المشتريات', icon:'🛒', sub:'فواتير الموردين والمرتجعات وأرصدة الموردين', first:'purchaseInvoice', views:[
     ['purchaseInvoice','فاتورة مشتريات',1],['purchaseReturn','مرتجع مشتريات',1],['suppliers','أرصدة الموردين'],['purchaseReports','تقارير المشتريات'],['statement','كشف حساب']]},
   inventory: {label:'المخازن',   icon:'🏭', sub:'الأرصدة والحركة والجرد والتصنيع', first:'invBalances', views:[
-    ['invBalances','أرصدة المخازن'],['stockCard','كارت الصنف'],['stockMove','حركة مخزنية',1],['stocktake','الجرد',1],['production','أوامر الإنتاج'],['recipes','الوصفات'],['products','الأصناف'],['warehouses','المخازن']]},
+    ['invBalances','أرصدة المخازن'],['stockCard','كارت الصنف'],['stockMove','حركة مخزنية',1],['stocktake','الجرد',1],['production','أوامر الشغل'],['recipes','الوجبات'],['products','الأصناف'],['warehouses','المخازن']]},
   tools:     {label:'الأدوات',   icon:'🧰', sub:'', first:'whatsapp', views:[['whatsapp','مركز الواتساب'],['backup','النسخ الاحتياطي'],['printSettings','الشعار والطباعة']]}
 };
 /* ---- permissions (per user, per screen): 0 = hidden, 1 = view, 2 = edit ---- */
@@ -4048,7 +4057,7 @@ function homeStats(){
   const bm = balMap(), net = pre => { let t = 0; for(const c in bm) if(c.startsWith(pre)) t += bm[c].d - bm[c].c; return t; };
   const mon = todayISO().slice(0,7);
   const ix = sidx(); let stockVal = 0, negs = 0, tracked = 0;
-  trackedItems().forEach(p=>{ tracked++; const o = ix[p.id]; if(o){ stockVal += o.q*avgOf(o); if(o.q< -1e-9) negs++; } });
+  trackedItems().forEach(p=>{ tracked++; const o = ix[p.id]; if(o){ stockVal += o.v; if(o.q< -1e-9) negs++; } });
   return {
     cash: net('1110'),
     entries: state.entries.length,
@@ -4079,12 +4088,796 @@ function viewHome(){
   }));
 }
 
+/* ===== v28: إعادة تصميم قسم المخازن (أكواد، باتشات، إذون بسيريال، كارت صنف، وجبات) ===== */
+const WH_DEFS = [
+  {id:'wh_raw',     code:'01', name:'مخزن الخامات',            kind:'raw'},
+  {id:'wh_pack',    code:'02', name:'مخزن التعبئة والتغليف',   kind:'pack'},
+  {id:'wh_tools',   code:'03', name:'مخزن الأدوات والمستهلكات', kind:'tool'},
+  {id:'wh_wip',     code:'04', name:'مخزن تحت التشغيل',        kind:'semi'},
+  {id:'wh_fg',      code:'05', name:'مخزن المنتج التام',       kind:'fg'},
+  {id:'wh_scrap',   code:'06', name:'مخزن الهالك',             kind:''},
+  {id:'wh_destroy', code:'07', name:'مخزن الإعدام',            kind:''}
+];
+const VCH = {
+  out:{label:'صرف', who:'طالب الصرف', whLabel:'من مخزن', kinds:[
+    {k:'raw',  l:'إذن صرف خامات',            wh:'wh_raw'},
+    {k:'pack', l:'إذن صرف تعبئة وتغليف',     wh:'wh_pack'},
+    {k:'tools',l:'إذن صرف أدوات ومستهلكات',  wh:'wh_tools'},
+    {k:'fg',   l:'إذن صرف منتج تام',         wh:'wh_fg'}]},
+  in:{label:'إضافة', who:'طالب الإضافة', whLabel:'إلى مخزن', kinds:[
+    {k:'sup',  l:'إذن إضافة موردين',            wh:'wh_raw'},
+    {k:'fg',   l:'إذن إضافة منتج تام',          wh:'wh_fg'},
+    {k:'wip',  l:'إذن إضافة منتج تحت التشغيل',  wh:'wh_wip'},
+    {k:'pret', l:'إذن مرتجع أصناف من الإنتاج',  wh:'wh_raw'},
+    {k:'cret', l:'إذن مرتجع عملاء مبيعات',      wh:'wh_fg'},
+    {k:'scrap',l:'إذن إضافة هوالك',             wh:'wh_scrap'}]}
+};
+const vkind = (t,k)=> ((VCH[t]||{kinds:[]}).kinds.find(x=>x.k===k));
+function whKind(id){ const w = whById(id); return (w && w.kind) || ''; }
+function whLabel(id){ const w = whById(id); return w ? ((w.code?w.code+' — ':'')+w.name) : '—'; }
+function whOpts(withNone){ return (withNone?[['','— غير مخزني (بدون تتبع) —']]:[]).concat(state.warehouses.map(w=>[w.id, whLabel(w.id)])); }
+function setupWarehouses28(){
+  if(!Array.isArray(state.warehouses) || !Array.isArray(state.products)) return;
+  if(!state.counters) state.counters = {entry:0, sale:0, purchase:0};
+  if(!state.counters.v28){
+    WH_DEFS.forEach(d=>{ if(!whById(d.id)) state.warehouses.push({id:d.id, name:d.name, code:d.code, kind:d.kind}); });
+    state.counters.v28 = 1;
+  }
+  const used = new Set(state.warehouses.map(w=>w.code).filter(Boolean));
+  state.warehouses.forEach(w=>{
+    const d = WH_DEFS.find(x=>x.id===w.id);
+    if(w.kind===undefined) w.kind = d ? d.kind : '';
+    if(!w.code){
+      let c = (d && !used.has(d.code)) ? d.code : null;
+      if(!c){ let n = 1; while(used.has(String(n).padStart(2,'0'))) n++; c = String(n).padStart(2,'0'); }
+      w.code = c; used.add(c);
+    }
+  });
+  state.warehouses.sort((a,b)=> String(a.code).localeCompare(String(b.code),'en',{numeric:true}));
+  state.products.forEach(p=>{ if(KINDS[p.kind] && !p.whId) p.whId = KINDS[p.kind].wh; });
+}
+function setItemWh(p, whId){
+  p.whId = whId || '';
+  if(!whId){ p.kind = 'none'; return; }
+  const k = whKind(whId);
+  if(k) p.kind = k; else if(!KINDS[p.kind]) p.kind = 'fg';
+  ensureStockAccounts();
+}
+function findItem(s){
+  s = String(s||'').trim(); if(!s) return null;
+  let p = state.products.find(x=>x.code && String(x.code)===s) || state.products.find(x=>x.name===s);
+  if(!p && s.indexOf(' — ')>0){ const c = s.split(' — ')[0].trim(); p = state.products.find(x=>x.code && String(x.code)===c); }
+  return (p && isTracked(p)) ? p : null;
+}
+function itemsDL28(id, filter){
+  const L = trackedItems().filter(filter||(()=>true));
+  return `<datalist id="${id}">${L.map(p=>`<option value="${escA(p.name)}">${esc(p.code||'')}</option>`).join('')}${L.filter(p=>p.code).map(p=>`<option value="${escA(p.code)}">${esc(p.name)}</option>`).join('')}</datalist>`;
+}
+function groupOf(p){ return p && p.kind==='pack' ? 'pack' : (p && p.kind==='tool' ? 'tool' : 'raw'); }
+const GROUPS = [['raw','أصناف مخزن الخامات'],['pack','أصناف مخزن التعبئة والتغليف'],['tool','أصناف الأدوات والمستهلكات']];
+function parseDate28(v){
+  v = String(v==null?'':v).trim(); if(!v) return '';
+  if(/^\d{5}(\.\d+)?$/.test(v)){ return new Date(Math.round((Number(v)-25569)*86400000)).toISOString().slice(0,10); }
+  let m = v.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/); if(m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
+  m = v.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})/); if(m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+  return '';
+}
+function nextSerial(t,k,peek){
+  if(!state.counters.vch) state.counters.vch = {};
+  const key = t+'|'+k, n = (state.counters.vch[key]||0)+1;
+  if(!peek) state.counters.vch[key] = n;
+  return String(n).padStart(4,'0');
+}
+function mvDesc(m){
+  if(m.vt){ const d = vkind(m.vt, m.vk); return d ? d.l : ''; }
+  return ({open:'رصيد أول المدة', prod_in:'أمر شغل — إنتاج', prod_out:'أمر شغل — صرف خامات', adjust:'تسوية جرد', tin:'تحويل وارد', tout:'تحويل صادر'})[m.type] || m.note || '';
+}
+/* FIFO allocation of an issue across batches (oldest production date first) */
+function allocOut(ix, itemId, whId, qty){
+  const o = ix[itemId];
+  const bs = o ? Object.values(o.b).filter(b=>b.wh===whId && b.q>1e-9).sort((a,b)=> (a.pd||'9999').localeCompare(b.pd||'9999') || a.batch.localeCompare(b.batch)) : [];
+  const res = []; let left = qty;
+  for(const b of bs){ if(left<=1e-9) break; const t = Math.min(b.q, left); res.push({batch:b.batch, pd:b.pd, qty:t}); b.q -= t; left -= t; }
+  if(left>1e-9) res.push({batch:'', pd:'', qty:left, short:true});
+  return res;
+}
+function batchesOf(ix, itemId, whId){
+  const o = ix[itemId]; if(!o) return [];
+  return Object.values(o.b).filter(b=>b.wh===whId).sort((a,b)=> (a.pd||'').localeCompare(b.pd||'') || a.batch.localeCompare(b.batch));
+}
+function setOpening(p, qty, batch, pd, cost, date){
+  state.stockMoves = state.stockMoves.filter(m=>!(m.itemId===p.id && m.type==='open'));
+  qty = num(qty); if(!qty) return;
+  addMove({date:date||todayISO(), type:'open', itemId:p.id, whId:itemWh(p), qty, unitCost:num(cost), va:num(cost)>0, refType:'manual', refId:uid(), batch:String(batch||'').trim(), pd:pd||'', note:'رصيد أول المدة'});
+}
+
+/* ---------- printing ---------- */
+function printSheet(title, html){
+  const pa = $('print-area'); if(!pa) return;
+  pa.innerHTML = `<style>.pt{width:100%;border-collapse:collapse;font-size:12.5px;margin:8px 0}.pt th,.pt td{border:1px solid #444;padding:5px 7px;text-align:center}.pt th{background:#eee}.pt td.r{text-align:right}.kv{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 18px;font-size:13.5px;margin:10px 0}</style>
+  <div style="display:flex;gap:14px;align-items:center;border-bottom:3px solid #1F4D3A;padding-bottom:10px;margin-bottom:12px">${logoHTML(60)}<div style="flex:1;text-align:center"><div style="font-size:20px;font-weight:700;color:#1F4D3A">${esc(state.company||'')}</div><div style="font-size:19px;font-weight:700;margin-top:3px">${esc(title)}</div></div><div style="display:flex;gap:14px;align-items:center">${logoRHTML(60)}</div></div>` + html;
+  window.print();
+}
+function sigBlock(names){
+  return `<div style="display:flex;gap:14px;margin-top:46px">${names.map(n=>`<div style="flex:1;text-align:center;border-top:1px solid #333;padding-top:6px;font-size:13px;font-weight:600">${esc(n)}</div>`).join('')}</div>`;
+}
+const SIG_V = ['أمين المخزن','مشرف الإنتاج','الاعتماد'];
+function voucherHTML(v){
+  const rows = v.lines.map((l,i)=>`<tr><td>${i+1}</td><td>${esc(l.code||'')}</td><td class="r">${esc(l.name)}</td><td>${esc(l.unit||'')}</td><td>${fmt(l.qty)}</td><td>${esc(l.pd||'')}</td><td>${esc(l.batch||'')}</td><td>${esc(l.note||'')}</td></tr>`).join('');
+  return `<div class="kv"><div><b>نوع الحركة:</b> ${esc(VCH[v.type].label)}</div><div><b>وصف الحركة:</b> ${esc(v.desc)}</div><div><b>السيريال:</b> ${esc(v.serial)}</div>
+  <div><b>تاريخ الإصدار:</b> ${esc(v.date)}</div><div><b>${esc(VCH[v.type].whLabel)}:</b> ${esc(whLabel(v.whId))}</div><div><b>${esc(VCH[v.type].who)}:</b> ${esc(v.who||'')}</div></div>
+  <table class="pt"><thead><tr><th>م</th><th>كود الصنف</th><th>وصف الصنف</th><th>الوحدة</th><th>الكمية</th><th>تاريخ الإنتاج</th><th>رقم التشغيلة (الباتش)</th><th>ملاحظات</th></tr></thead><tbody>${rows}</tbody></table>
+  ${v.note?`<div style="font-size:13px"><b>ملاحظات:</b> ${esc(v.note)}</div>`:''}${sigBlock(SIG_V)}`;
+}
+function printVoucher(v){ printSheet(`${v.desc} — رقم ${v.serial}`, voucherHTML(v)); }
+
+/* ---------- إشعارات ---------- */
+function injectNotices(kinds){
+  if(!Array.isArray(state.notices)) return;
+  const list = state.notices.filter(n=>!n.done && kinds.includes(n.kind));
+  if(!list.length) return;
+  const box = document.createElement('div'); box.className = 'card';
+  box.innerHTML = `<h3 style="margin-top:0">🔔 إشعارات (${list.length})</h3>` + list.slice(-8).reverse().map(n=>`<div style="display:flex;gap:10px;align-items:center;justify-content:space-between;padding:7px 0;border-top:1px solid var(--line);font-size:13.5px"><span>${esc(n.date)} — ${esc(n.text)}</span>${READONLY?'':`<button class="btn secondary small" data-nd="${n.id}">تم الاطلاع ✓</button>`}</div>`).join('');
+  main.insertBefore(box, main.firstChild);
+  box.querySelectorAll('[data-nd]').forEach(b=> b.addEventListener('click', ()=>{ const n = state.notices.find(x=>x.id===b.dataset.nd); if(n){ n.done = true; save(); } box.remove(); injectNotices(kinds); }));
+}
+function pushNotice(kind, text, ref){ ensureState(); state.notices.push({id:uid(), kind, date:todayISO(), text, ref:ref||'', done:false}); }
+
+/* ---------- الأصناف ---------- */
+let itemQ = '', impPlan = null;
+function itemSearchMatch(p, q){ q = q.trim(); if(!q) return true; return (p.name||'').includes(q) || String(p.code||'').toLowerCase().includes(q.toLowerCase()); }
+function viewProducts28(){
+  ensureState();
+  const ro = READONLY;
+  main.innerHTML = `<h2 class="view-title">الأصناف</h2>
+  <p class="view-sub">كل صنف له كود واسم ووحدة ونوع مخزن (من المخازن المتاحة) ورصيد أول المدة برقم التشغيلة وتاريخ الإنتاج. الصنف اللي نوع مخزنه "غير مخزني" مش بيتتبع في المخازن.</p>
+  ${ro?'':`<div class="card"><h3>إضافة صنف</h3>
+    <div class="grid3">
+      <div class="field"><label>كود الصنف</label><input type="text" id="p-code"></div>
+      <div class="field"><label>اسم الصنف</label><input type="text" id="p-name"></div>
+      <div class="field"><label>الوحدة</label><input type="text" id="p-unit" list="p-units" placeholder="كجم / عبوة / كرتونة"><datalist id="p-units"><option value="كجم"><option value="عبوة"><option value="كرتونة"><option value="قطعة"><option value="لتر"><option value="جرام"></datalist></div>
+      <div class="field"><label>نوع المخزن</label>${sel('p-wh', whOpts(true), '')}</div>
+      <div class="field"><label>رصيد أول المدة</label><input type="number" step="any" id="p-open"></div>
+      <div class="field"><label>رقم الباتش / التشغيلة</label><input type="text" id="p-batch"></div>
+      <div class="field"><label>تاريخ الإنتاج</label><input type="date" id="p-pd"></div>
+      <div class="field"><label>تكلفة وحدة الرصيد (اختياري)</label><input type="number" step="any" id="p-cost"></div>
+      <div class="field"><label>الموقع (لوكيشن)</label><input type="text" id="p-loc"></div>
+    </div>
+    <div id="p-msg"></div>
+    <button class="btn" id="p-add">إضافة الصنف</button>
+    <button class="btn secondary" id="p-seed" type="button">➕ إضافة أصناف الفواتير الموجودة</button></div>
+  <div class="card"><h3>📥 استيراد الأصناف من إكسيل (مرة واحدة لكل الأصناف)</h3>
+    <p class="view-sub" style="margin:0 0 8px">الأعمدة: <b>مسلسل — كود الصنف — اسم الصنف — الوحدة — رصيد أول المدة — نوع المخزن</b> (واختياري: رقم الباتش، تاريخ الإنتاج، تكلفة الوحدة، الموقع). نوع المخزن ممكن يكون اسم المخزن أو كوده. لو الصنف عنده أكتر من باتش اكتبه في أكتر من صف. إعادة الاستيراد بتحدّث الأصناف وبتستبدل رصيد أول المدة.</p>
+    <div class="grid3"><div class="field"><label>تاريخ رصيد أول المدة</label><input type="date" id="imp-date" value="${todayISO()}"></div></div>
+    <input type="file" id="imp-file" accept=".xlsx,.csv,.txt,.tsv" style="display:none">
+    <button class="btn" type="button" id="imp-btn">📂 اختيار ملف الأصناف</button>
+    <button class="btn secondary" type="button" id="imp-tpl">⬇️ تحميل نموذج</button>
+    <div id="imp-out" style="margin-top:12px"></div></div>`}
+  <div class="card"><h3 id="p-count">الأصناف</h3><div class="field" style="max-width:320px"><label>بحث (كود أو اسم)</label><input type="text" id="p-q" value="${escA(itemQ)}"></div><div id="p-table" class="tbl-wrap"></div></div>`;
+  if(!ro){
+    $('p-add').addEventListener('click', ()=>{
+      const name = $('p-name').value.trim(), code = $('p-code').value.trim(), msg = $('p-msg');
+      if(!name){ msg.innerHTML = `<div class="msg err">اكتب اسم الصنف</div>`; return; }
+      if(productByName(name)){ msg.innerHTML = `<div class="msg err">الصنف موجود بالفعل</div>`; return; }
+      if(code && state.products.some(x=>String(x.code||'')===code)){ msg.innerHTML = `<div class="msg err">الكود ده مستخدم لصنف تاني</div>`; return; }
+      const p = {id:uid(), code, name, type:'both', kind:'none', unit:$('p-unit').value.trim(), whId:'', price:0, loc:$('p-loc').value.trim(), notes:''};
+      setItemWh(p, $('p-wh').value);
+      state.products.push(p);
+      if(isTracked(p)) setOpening(p, $('p-open').value, $('p-batch').value, $('p-pd').value, $('p-cost').value);
+      save(); viewProducts28(); toast('تمت إضافة الصنف ✓');
+    });
+    $('p-seed').addEventListener('click', ()=>{
+      const names = new Set();
+      state.salesInvoices.concat(state.salesReturns).forEach(i=>(i.items||[]).forEach(t=>names.add(t.item)));
+      state.purchaseInvoices.forEach(i=>(i.items||[]).forEach(t=>names.add(t.item)));
+      let n = 0;
+      names.forEach(nm=>{ if(nm && !productByName(nm)){ state.products.push({id:uid(), code:'', name:nm, type:'both', kind:'none', unit:'', whId:'', price:0}); n++; } });
+      save(); viewProducts28(); toast(n ? `اتضاف ${n} صنف. حدّد "نوع المخزن" لكل صنف عايز تتبعه.` : 'مفيش أصناف جديدة في الفواتير');
+    });
+    $('imp-btn').addEventListener('click', ()=> $('imp-file').click());
+    $('imp-tpl').addEventListener('click', itemsTemplate28);
+    $('imp-file').addEventListener('change', async e=>{
+      const f = e.target.files[0]; if(!f) return; e.target.value = '';
+      const out = $('imp-out'); out.innerHTML = '<div class="empty">جاري قراءة الملف...</div>';
+      try{ impPlan = planItemsImport(await readOrdersFile(f), $('imp-date').value || todayISO()); drawImpPlan(); }
+      catch(err){ console.error(err); out.innerHTML = `<div class="msg err">${esc(err.message||'تعذّرت قراءة الملف')}</div>`; }
+    });
+  }
+  $('p-q').addEventListener('input', e=>{ itemQ = e.target.value; drawProductsTable28(); });
+  drawProductsTable28();
+}
+function itemsTemplate28(){
+  const rows = [['مسلسل','كود الصنف','اسم الصنف','الوحدة','رصيد أول المدة','نوع المخزن','رقم الباتش','تاريخ الإنتاج','تكلفة الوحدة'],
+    ['1','RM-001','ثوم مقشر','كجم','500','مخزن الخامات','','',''],
+    ['2','FG-144','ثوم سادة مفروم مجمد مكعبات 144 جرام','عبوة','1200','مخزن المنتج التام','B-2601','2026-09-01',''],
+    ['3','FG-144','ثوم سادة مفروم مجمد مكعبات 144 جرام','عبوة','800','مخزن المنتج التام','B-2602','2026-09-15','']];
+  downloadBlob(new Blob(['﻿'+rows.map(r=>r.join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}), 'نموذج-استيراد-الاصناف.csv');
+}
+function normAr(s){ return String(s||'').replace(/[أإآ]/g,'ا').replace(/ة/g,'ه').replace(/ى/g,'ي').replace(/\s+/g,' ').trim(); }
+function resolveWh(txt){
+  const t = normAr(txt); if(!t) return '';
+  let w = state.warehouses.find(x=>String(x.code)===t.replace(/^0+(?=\d)/,'0')) || state.warehouses.find(x=>normAr(x.name)===t) || state.warehouses.find(x=>String(x.code)===t);
+  if(w) return w.id;
+  w = state.warehouses.find(x=>{ const n = normAr(x.name); return n.includes(t) || t.includes(n); }); if(w) return w.id;
+  const has = s=> t.includes(s);
+  const pick = id => whById(id) ? id : '';
+  if(has('اعدام')) return pick('wh_destroy'); if(has('هالك')||has('هوالك')) return pick('wh_scrap');
+  if(has('تحت')) return pick('wh_wip'); if(has('تعبئه')||has('تغليف')) return pick('wh_pack');
+  if(has('ادوات')||has('مستهلك')) return pick('wh_tools'); if(has('تام')) return pick('wh_fg'); if(has('خام')) return pick('wh_raw');
+  return '';
+}
+function planItemsImport(rows, date){
+  let hi = rows.findIndex(r=>r.some(c=>/كود|اسم|وصف|الصنف/.test(c)));
+  if(hi<0) throw new Error('مش لاقي صف العناوين (كود الصنف / اسم الصنف ...) في الملف');
+  const heads = rows[hi].map(h=>normAr(h)), col = {};
+  const cats = [['code',/كود|code/i],['batch',/باتش|تشغيل|batch/i],['pd',/تاريخ|انتاج/],['cost',/تكلف|سعر/],['loc',/لوكيشن|موقع/],['unit',/وحد/],['open',/رصيد|كميه|افتتاح|بدايه/],['wh',/مخزن|نوع/],['name',/اسم|وصف|صنف|بيان/]];
+  heads.forEach((h,i)=>{ if(!h) return; for(const [k,re] of cats){ if(re.test(h) && col[k]===undefined){ col[k] = i; break; } } });
+  if(col.name===undefined) throw new Error('مش لاقي عمود "اسم الصنف"');
+  const items = new Map(), errors = []; let lines = 0;
+  rows.slice(hi+1).forEach((r,ri)=>{
+    const g = k => col[k]===undefined ? '' : String(r[col[k]]==null?'':r[col[k]]).trim();
+    const name = g('name'), code = g('code'); if(!name && !code) return;
+    const key = code || name;
+    let it = items.get(key);
+    if(!it){ it = {code, name, unit:g('unit'), whTxt:g('wh'), loc:g('loc'), rows:[], hasOpen:false, line:hi+ri+2}; items.set(key, it); }
+    if(!it.name) it.name = name; if(!it.unit) it.unit = g('unit'); if(!it.whTxt) it.whTxt = g('wh');
+    if(col.open!==undefined && g('open')!==''){ it.hasOpen = true; const q = num(g('open').replace(/,/g,'')); if(q) { it.rows.push({qty:q, batch:g('batch'), pd:parseDate28(g('pd')), cost:num(g('cost').replace(/,/g,''))}); lines++; } }
+  });
+  const list = [...items.values()];
+  list.forEach(it=>{
+    it.whId = it.whTxt ? resolveWh(it.whTxt) : '';
+    if(it.whTxt && !it.whId) errors.push(`صف ${it.line}: نوع المخزن "${it.whTxt}" مش مطابق لأي مخزن — "${it.name}" هيتسجل غير مخزني`);
+    if(!it.name) errors.push(`صف ${it.line}: صنف بكود ${it.code} من غير اسم — هيتم تجاهله`);
+    it.existing = state.products.find(p=> (it.code && String(p.code||'')===it.code) || p.name===it.name);
+  });
+  return {date, list:list.filter(i=>i.name), errors, lines};
+}
+function drawImpPlan(){
+  const out = $('imp-out'), P = impPlan; if(!P) return;
+  const nNew = P.list.filter(i=>!i.existing).length, nUp = P.list.length-nNew;
+  out.innerHTML = `<div class="msg ok">تمت قراءة ${P.list.length} صنف (${nNew} جديد، ${nUp} هيتحدّث) و ${P.lines} سطر رصيد أول المدة.</div>
+  ${P.errors.length?`<div class="msg err" style="max-height:140px;overflow:auto">${P.errors.slice(0,40).map(esc).join('<br>')}</div>`:''}
+  <div class="tbl-wrap" style="max-height:260px;overflow:auto"><table><thead><tr><th>كود</th><th>الصنف</th><th>الوحدة</th><th>المخزن</th><th>أرصدة (باتشات)</th></tr></thead><tbody>${P.list.slice(0,60).map(i=>`<tr><td>${esc(i.code)}</td><td>${esc(i.name)}</td><td>${esc(i.unit)}</td><td>${esc(i.whId?whLabel(i.whId):'غير مخزني')}</td><td class="tabular">${i.rows.length?fmt(i.rows.reduce((s,x)=>s+x.qty,0))+' ('+i.rows.length+')':'—'}</td></tr>`).join('')}</tbody></table></div>
+  <button class="btn" id="imp-go">✅ تأكيد الاستيراد</button> <button class="btn secondary" id="imp-cancel" type="button">إلغاء</button>`;
+  $('imp-cancel').addEventListener('click', ()=>{ impPlan = null; out.innerHTML = ''; });
+  $('imp-go').addEventListener('click', ()=>{
+    let nn = 0, nu = 0;
+    P.list.forEach(it=>{
+      let p = it.existing;
+      if(!p){ p = {id:uid(), code:it.code, name:it.name, type:'both', kind:'none', unit:it.unit, whId:'', price:0, loc:it.loc, notes:''}; state.products.push(p); nn++; }
+      else { nu++; if(it.code && !p.code) p.code = it.code; if(it.unit) p.unit = it.unit; if(it.loc) p.loc = it.loc; }
+      if(it.whTxt){ setItemWh(p, it.whId); }
+      if(isTracked(p) && it.hasOpen){
+        state.stockMoves = state.stockMoves.filter(m=>!(m.itemId===p.id && m.type==='open'));
+        it.rows.forEach(r=> addMove({date:P.date, type:'open', itemId:p.id, whId:itemWh(p), qty:r.qty, unitCost:r.cost, va:r.cost>0, refType:'manual', refId:uid(), batch:r.batch, pd:r.pd, note:'رصيد أول المدة'}));
+      }
+    });
+    save(); impPlan = null; viewProducts28(); toast(`تم الاستيراد ✓ — ${nn} صنف جديد، ${nu} محدّث`);
+  });
+}
+function drawProductsTable28(){
+  const wrap = $('p-table'), ro = READONLY, ix = sidx();
+  const all = state.products.slice().sort((a,b)=> String(a.code||'￿').localeCompare(String(b.code||'￿'),'en') || a.name.localeCompare(b.name,'ar'));
+  const list = all.filter(p=>itemSearchMatch(p, itemQ));
+  $('p-count').textContent = `الأصناف (${list.length}${list.length!==all.length?' من '+all.length:''})`;
+  if(!list.length){ wrap.innerHTML = '<div class="empty">لا توجد أصناف</div>'; return; }
+  const shown = list.slice(0, 400);
+  wrap.innerHTML = `<table><thead><tr><th>م</th><th>كود الصنف</th><th>اسم الصنف</th><th>الوحدة</th><th>نوع المخزن</th><th>رصيد أول المدة</th><th>رقم الباتش</th><th>تاريخ الإنتاج</th><th>الرصيد الحالي</th><th>الموقع</th><th></th></tr></thead><tbody>${shown.map((p,i)=>{
+    const tr = isTracked(p), om = state.stockMoves.filter(m=>m.itemId===p.id && m.type==='open'), o = ix[p.id], q = o ? o.q : 0;
+    const single = om.length<=1, m0 = om[0] || {};
+    const wl = p.whId ? whLabel(p.whId) : 'غير مخزني';
+    if(ro) return `<tr><td>${i+1}</td><td>${esc(p.code||'')}</td><td>${esc(p.name)}</td><td>${esc(p.unit||'')}</td><td>${esc(wl)}</td><td class="tabular">${tr?fmt(om.reduce((s,m)=>s+m.qty,0)):'—'}</td><td>${esc(m0.batch||'')}</td><td>${esc(m0.pd||'')}</td><td class="tabular">${tr?fmt(q):'—'}</td><td>${esc(p.loc||'')}</td><td></td></tr>`;
+    return `<tr><td>${i+1}</td><td><input type="text" data-f="code" data-id="${p.id}" value="${escA(p.code||'')}" style="width:90px"></td>
+      <td><input type="text" data-f="name" data-id="${p.id}" value="${escA(p.name)}" style="min-width:200px"></td>
+      <td><input type="text" data-f="unit" data-id="${p.id}" value="${escA(p.unit||'')}" style="width:70px"></td>
+      <td>${sel('', whOpts(true), p.whId||'', `data-f="whId" data-id="${p.id}"`)}</td>
+      <td>${tr ? (single ? `<input type="number" step="any" data-o="qty" data-id="${p.id}" value="${m0.qty||''}" style="width:90px">` : `<span class="tag">${om.length} باتش</span>`) : '—'}</td>
+      <td>${tr && single ? `<input type="text" data-o="batch" data-id="${p.id}" value="${escA(m0.batch||'')}" style="width:90px">` : ''}</td>
+      <td>${tr && single ? `<input type="date" data-o="pd" data-id="${p.id}" value="${escA(m0.pd||'')}">` : ''}</td>
+      <td class="tabular">${tr?fmt(q):'—'}</td>
+      <td><input type="text" data-f="loc" data-id="${p.id}" value="${escA(p.loc||'')}" style="width:80px"></td>
+      <td><button class="btn danger small" data-del="${p.id}">حذف</button></td></tr>`;
+  }).join('')}</tbody></table>${list.length>shown.length?`<div class="empty">معروض أول ${shown.length} — استخدم البحث لتضييق النتائج</div>`:''}`;
+  wrap.querySelectorAll('[data-f]').forEach(el=> el.addEventListener('change', ()=>{
+    const p = itemById(el.dataset.id); if(!p) return; const f = el.dataset.f, v = el.value.trim();
+    if(f==='code' && v && state.products.some(x=>x.id!==p.id && String(x.code||'')===v)){ toast('الكود ده مستخدم لصنف تاني', true); el.value = p.code||''; return; }
+    if(f==='name'){ if(!v || state.products.some(x=>x.id!==p.id && x.name===v)){ toast('الاسم فاضي أو مكرر', true); el.value = p.name; return; } }
+    if(f==='whId'){
+      setItemWh(p, el.value);
+      state.stockMoves.forEach(m=>{ if(m.itemId===p.id && m.type==='open') m.whId = itemWh(p); });
+    } else p[f] = v;
+    save(); if(f==='whId') drawProductsTable28();
+  }));
+  wrap.querySelectorAll('[data-o]').forEach(el=> el.addEventListener('change', ()=>{
+    const p = itemById(el.dataset.id); if(!p) return;
+    const row = el.closest('tr'), g = k => row.querySelector(`[data-o="${k}"]`);
+    const old = state.stockMoves.find(m=>m.itemId===p.id && m.type==='open');
+    setOpening(p, g('qty').value, g('batch').value, g('pd').value, old?old.unitCost:0, old?old.date:todayISO());
+    save(); drawProductsTable28();
+  }));
+  wrap.querySelectorAll('[data-del]').forEach(b=> b.addEventListener('click', ()=>{
+    const p = itemById(b.dataset.del);
+    if(state.stockMoves.some(m=>m.itemId===p.id && m.type!=='open') || state.recipes.some(r=>r.outId===p.id || r.lines.some(l=>l.itemId===p.id))){ toast('الصنف ده عليه حركة مخزنية أو وجبة — مينفعش يتحذف', true); return; }
+    if(!confirmTwice(b)) return;
+    state.stockMoves = state.stockMoves.filter(m=>m.itemId!==p.id);
+    state.products = state.products.filter(x=>x.id!==p.id); save(); drawProductsTable28();
+  }));
+}
+
+/* ---------- المخازن ---------- */
+function viewWarehouses28(){
+  ensureState();
+  const ix = sidx(), ro = READONLY;
+  const stats = id => { let n = 0; state.products.forEach(p=>{ const o = ix[p.id]; if(o && Math.abs(o.wh[id]||0)>1e-9) n++; }); return n; };
+  const nextCode = ()=>{ const used = new Set(state.warehouses.map(w=>w.code)); let n = 1; while(used.has(String(n).padStart(2,'0'))) n++; return String(n).padStart(2,'0'); };
+  main.innerHTML = `<h2 class="view-title">المخازن</h2><p class="view-sub">كل مخزن له كود ثابت. "يتبع حساب" بيحدد أي حساب مخزون في الشجرة بتتحسب عليه أصناف المخزن ده.</p>
+  ${ro?'':`<div class="card"><h3>إضافة مخزن</h3><div class="grid3"><div class="field"><label>كود المخزن</label><input type="text" id="w-code" value="${nextCode()}"></div><div class="field"><label>اسم المخزن</label><input type="text" id="w-name"></div>
+  <div class="field"><label>يتبع حساب</label>${sel('w-kind',[['','— (بدون قيود: هالك / إعدام)'],['raw','مخزون خامات'],['pack','مخزون تعبئة وتغليف'],['tool','مخزون أدوات ومستهلكات'],['semi','مخزون تحت التشغيل'],['fg','مخزون منتج تام']],'raw')}</div></div>
+  <div id="w-msg"></div><button class="btn" id="w-add">إضافة</button></div>`}
+  <div class="card"><h3>المخازن</h3><table><thead><tr><th>الكود</th><th>المخزن</th><th>يتبع حساب</th><th>أصناف بها رصيد</th><th></th></tr></thead><tbody>${state.warehouses.map(w=>`<tr><td>${ro?esc(w.code):`<input type="text" data-wc="${w.id}" value="${escA(w.code||'')}" style="width:70px">`}</td><td>${ro?esc(w.name):`<input type="text" data-wn="${w.id}" value="${escA(w.name)}">`}</td><td>${esc(({raw:'خامات',pack:'تعبئة وتغليف',tool:'أدوات ومستهلكات',semi:'تحت التشغيل',fg:'منتج تام'})[w.kind]||'—')}</td><td class="tabular">${stats(w.id)}</td><td>${ro?'':`<button class="btn danger small" data-wd="${w.id}">حذف</button>`}</td></tr>`).join('')}</tbody></table></div>`;
+  if(ro) return;
+  $('w-add').addEventListener('click', ()=>{
+    const n = $('w-name').value.trim(), c = $('w-code').value.trim(), msg = $('w-msg');
+    if(!n || !c){ msg.innerHTML = '<div class="msg err">اكتب الكود والاسم</div>'; return; }
+    if(state.warehouses.some(w=>w.code===c)){ msg.innerHTML = '<div class="msg err">الكود ده مستخدم لمخزن تاني</div>'; return; }
+    state.warehouses.push({id:'wh_'+uid(), name:n, code:c, kind:$('w-kind').value}); save(); viewWarehouses28();
+  });
+  main.querySelectorAll('[data-wn]').forEach(el=> el.addEventListener('change', ()=>{ const w = whById(el.dataset.wn); if(w && el.value.trim()){ w.name = el.value.trim(); save(); } }));
+  main.querySelectorAll('[data-wc]').forEach(el=> el.addEventListener('change', ()=>{
+    const w = whById(el.dataset.wc), v = el.value.trim();
+    if(!v || state.warehouses.some(x=>x.id!==w.id && x.code===v)){ toast('الكود فاضي أو مستخدم', true); el.value = w.code; return; }
+    w.code = v; save();
+  }));
+  main.querySelectorAll('[data-wd]').forEach(b=> b.addEventListener('click', ()=>{
+    const id = b.dataset.wd;
+    if(state.warehouses.length<=1){ toast('لازم يفضل مخزن واحد على الأقل', true); return; }
+    if(state.stockMoves.some(m=>m.whId===id) || state.products.some(p=>p.whId===id)){ toast('المخزن عليه حركة أو أصناف — مينفعش يتحذف', true); return; }
+    if(!confirmTwice(b)) return;
+    state.warehouses = state.warehouses.filter(w=>w.id!==id); save(); viewWarehouses28();
+  }));
+}
+
+/* ---------- أرصدة المخازن ---------- */
+let balF = {wh:'', q:'', zero:false};
+function viewBalances28(){
+  ensureState();
+  const ix = sidx(), rows = [];
+  trackedItems().forEach(p=>{
+    if(!itemSearchMatch(p, balF.q)) return;
+    const o = ix[p.id], whs = new Set(); if(o) Object.keys(o.wh).forEach(w=>whs.add(w)); whs.add(itemWh(p));
+    whs.forEach(w=>{
+      if(balF.wh && w!==balF.wh) return;
+      const q = o ? (o.wh[w]||0) : 0;
+      if(!balF.zero && Math.abs(q)<1e-9) return;
+      rows.push({p, w, q});
+    });
+  });
+  rows.sort((a,b)=> (whById(a.w)||{code:''}).code.localeCompare((whById(b.w)||{code:''}).code) || String(a.p.code||'').localeCompare(String(b.p.code||''),'en') || a.p.name.localeCompare(b.p.name,'ar'));
+  const neg = rows.filter(r=>r.q< -1e-9).length;
+  const bm = {}; state.entries.forEach(e=>e.lines.forEach(l=>{ const b = bm[l.code]||(bm[l.code]={d:0,c:0}); b.d+=num(l.debit); b.c+=num(l.credit); }));
+  const recon = Object.keys(KINDS).map(k=>{
+    const code = KINDS[k].acc, b = bm[code]||{d:0,c:0};
+    let sv = 0; trackedItems().filter(p=>p.kind===k).forEach(p=>{ const o = ix[p.id]; if(o) sv += o.v; });
+    return {label:KINDS[k].label, gl:b.d-b.c, st:sv};
+  });
+  main.innerHTML = `<h2 class="view-title">أرصدة المخازن</h2><p class="view-sub">الكميات الفعلية لكل صنف في كل مخزن (مجموع كل الباتشات). الكميات بتتحرك بالإذون المخزنية وأوامر الشغل والجرد.</p>
+  <div class="card"><div class="grid3">
+    <div class="field"><label>المخزن</label>${sel('bf-wh',[['','كل المخازن']].concat(whOpts()),balF.wh)}</div>
+    <div class="field"><label>بحث (كود أو اسم)</label><input type="text" id="bf-q" value="${escA(balF.q)}"></div>
+    <div class="field"><label>&nbsp;</label><label style="font-weight:400"><input type="checkbox" id="bf-zero" ${balF.zero?'checked':''}> إظهار الأصناف الصفرية</label></div>
+  </div>
+  ${neg?`<div class="msg err">⚠️ ${neg} صنف رصيده بالسالب — راجع الإذون أو رصيد أول المدة</div>`:''}
+  <div class="tbl-wrap"><table><thead><tr><th>م</th><th>الكود</th><th>الوصف</th><th>الكمية</th><th>الوحدة</th><th>نوع المخزن</th><th>ملاحظات</th><th>كارت صنف</th></tr></thead>
+  <tbody>${rows.slice(0,600).map((r,i)=>`<tr><td>${i+1}</td><td>${esc(r.p.code||'')}</td><td>${esc(r.p.name)}</td><td class="tabular" style="${r.q<0?'color:#A63D2F;font-weight:700':''}">${fmt(r.q)}</td><td>${esc(unitOf(r.p))}</td><td>${esc(whLabel(r.w))}</td><td>${esc(r.p.notes||'')}</td><td><button class="btn secondary small" data-card="${r.p.id}|${r.w}">📇 كارت</button></td></tr>`).join('') || '<tr><td colspan="8" class="empty">لا توجد أرصدة. ابدأ باستيراد الأصناف برصيد أول المدة أو بإذن إضافة.</td></tr>'}</tbody>
+  <tfoot><tr style="font-weight:700"><td colspan="3">عدد الأصناف المعروضة</td><td class="tabular">${rows.length}</td><td colspan="4"></td></tr></tfoot></table></div></div>
+  <div class="card"><h3>مطابقة قيمة المخزن مع الحسابات</h3><p class="view-sub" style="margin:0 0 8px">قيمة المخزن (بمتوسط التكلفة) مقابل رصيد حسابات المخزون. الفرق الطبيعي: أرصدة أول المدة اللي قيمتها داخلة بالفعل في الأرصدة الافتتاحية للحسابات.</p>
+  <table><thead><tr><th>النوع</th><th>قيمة المخزن</th><th>رصيد الحسابات</th><th>الفرق</th></tr></thead><tbody>${recon.map(r=>`<tr><td>${esc(r.label)}</td><td class="tabular">${fmt(r.st)}</td><td class="tabular">${fmt(r.gl)}</td><td class="tabular">${fmt(r.st-r.gl)}</td></tr>`).join('')}</tbody></table></div>`;
+  injectNotices(['prod']);
+  $('bf-wh').addEventListener('change', e=>{ balF.wh = e.target.value; viewBalances28(); });
+  $('bf-q').addEventListener('change', e=>{ balF.q = e.target.value; viewBalances28(); });
+  $('bf-zero').addEventListener('change', e=>{ balF.zero = e.target.checked; viewBalances28(); });
+  main.querySelectorAll('[data-card]').forEach(b=> b.addEventListener('click', ()=>{ const [i,w] = b.dataset.card.split('|'); cardV = {whId:w, itemId:i, q:''}; currentView = 'stockCard'; render(); }));
+}
+
+/* ---------- كارت الصنف المخزني ---------- */
+let cardV = {whId:'', itemId:'', q:''};
+function cardItemsOf(whId, ix){
+  return trackedItems().filter(p=> itemWh(p)===whId || (ix[p.id] && (Object.keys(ix[p.id].wh).includes(whId))))
+    .sort((a,b)=> String(a.code||'').localeCompare(String(b.code||''),'en') || a.name.localeCompare(b.name,'ar'));
+}
+function viewStockCard28(){
+  ensureState();
+  const ix = sidx(), c = cardV;
+  if(!c.whId || !whById(c.whId)){
+    main.innerHTML = `<h2 class="view-title">كارت الصنف المخزني</h2><p class="view-sub">اختار نوع المخزن الأول، وبعدها هتشوف أصناف المخزن ده بس.</p>
+    <div class="card"><h3>نوع المخزن</h3><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px">${state.warehouses.map(w=>`<button class="btn secondary" style="padding:16px 10px;font-size:15px" data-w="${w.id}">${esc(w.code)} — ${esc(w.name)}</button>`).join('')}</div></div>`;
+    main.querySelectorAll('[data-w]').forEach(b=> b.addEventListener('click', ()=>{ cardV = {whId:b.dataset.w, itemId:'', q:''}; viewStockCard28(); }));
+    return;
+  }
+  const w = whById(c.whId);
+  if(!c.itemId || !itemById(c.itemId)){
+    const items = cardItemsOf(c.whId, ix).filter(p=>itemSearchMatch(p, c.q));
+    main.innerHTML = `<h2 class="view-title">كارت الصنف المخزني — ${esc(w.name)}</h2>
+    <div class="card"><button class="btn secondary small" id="cd-back">← تغيير المخزن</button>
+    <div class="field" style="max-width:320px;margin-top:10px"><label>بحث (كود أو اسم)</label><input type="text" id="cd-q" value="${escA(c.q)}"></div>
+    <div class="tbl-wrap"><table><thead><tr><th>م</th><th>الكود</th><th>الصنف</th><th>الوحدة</th><th>الرصيد بالمخزن</th><th></th></tr></thead><tbody>${items.slice(0,500).map((p,i)=>`<tr><td>${i+1}</td><td>${esc(p.code||'')}</td><td>${esc(p.name)}</td><td>${esc(unitOf(p))}</td><td class="tabular">${fmt((ix[p.id]&&ix[p.id].wh[c.whId])||0)}</td><td><button class="btn small" data-i="${p.id}">فتح الكارت</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">لا توجد أصناف في المخزن ده</td></tr>'}</tbody></table></div></div>`;
+    $('cd-back').addEventListener('click', ()=>{ cardV = {whId:'', itemId:'', q:''}; viewStockCard28(); });
+    $('cd-q').addEventListener('change', e=>{ cardV.q = e.target.value; viewStockCard28(); });
+    main.querySelectorAll('[data-i]').forEach(b=> b.addEventListener('click', ()=>{ cardV.itemId = b.dataset.i; viewStockCard28(); }));
+    return;
+  }
+  const p = itemById(c.itemId);
+  const mv = state.stockMoves.map((m,i)=>({m,i})).filter(x=>x.m.itemId===p.id && x.m.whId===c.whId && x.m.ph!==false).sort((a,b)=> (a.m.date||'').localeCompare(b.m.date||'') || a.i-b.i).map(x=>x.m);
+  const buckets = {}; mv.forEach(m=>{ const k = (m.batch||'')+'|'+(m.pd||''); (buckets[k]||(buckets[k]={batch:m.batch||'', pd:m.pd||'', moves:[]})).moves.push(m); });
+  const cards = Object.values(buckets).sort((a,b)=> (a.pd||'').localeCompare(b.pd||'') || a.batch.localeCompare(b.batch));
+  let total = 0;
+  const cardsHTML = cards.map((k,ci)=>{
+    let run = 0;
+    const rows = k.moves.map((m,i)=>{ run += m.qty; return `<tr><td>${i+1}</td><td>${esc(m.date||'')}</td><td>${m.qty>=0?'إضافة':'صرف'}${mvDesc(m)?' — '+esc(mvDesc(m)):''}${m.serial?' #'+esc(m.serial):''}</td><td class="tabular">${fmt(Math.abs(m.qty))}</td><td class="tabular">${fmt(run)}</td><td>${esc(m.pd||'')}</td><td>${esc(m.batch||'')}</td><td>${esc((m.refType==='voucher'||m.type==='open')?(m.note||''):(m.note||''))}</td></tr>`; }).join('');
+    total += run;
+    return `<div style="margin:12px 0"><div style="font-weight:700;margin-bottom:4px;font-size:14px">كارت ${ci+1}${cards.length>1||k.batch||k.pd?` — باتش: ${esc(k.batch||'—')} — تاريخ الإنتاج: ${esc(k.pd||'—')}`:''} <span class="tag">رصيد الكارت ${fmt(run)} ${esc(unitOf(p))}</span></div>
+    <table class="pt" style="width:100%"><thead><tr><th>م</th><th>التاريخ</th><th>نوع الحركة</th><th>الكمية</th><th>الرصيد الحالي</th><th>تاريخ الإنتاج</th><th>الباتش</th><th>ملاحظات</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  }).join('') || '<div class="empty">لا توجد حركات على الصنف في المخزن ده</div>';
+  const body = `<div class="kv"><div><b>اسم الصنف:</b> ${esc(p.name)}</div><div><b>كود الصنف:</b> ${esc(p.code||'—')}</div><div><b>نوع المخزن:</b> ${esc(whLabel(c.whId))}</div><div><b>الموقع:</b> ${esc(p.loc||'—')}</div><div><b>الوحدة:</b> ${esc(unitOf(p)||'—')}</div><div><b>الرصيد الحالي (إجمالي الكروت):</b> ${fmt(total)} ${esc(unitOf(p))}</div></div>
+  ${cardsHTML}<div style="font-weight:700;margin-top:8px">إجمالي رصيد الصنف (مجموع ${cards.length} كارت): ${fmt(total)} ${esc(unitOf(p))}</div>${sigBlock(['الحسابات','المخازن','الاعتماد'])}`;
+  main.innerHTML = `<h2 class="view-title">كارت صنف مخزني</h2>
+  <div class="card"><button class="btn secondary small" id="cd-back">← أصناف ${esc(w.name)}</button> <button class="btn secondary small" id="cd-wh">تغيير المخزن</button> <button class="btn small" id="cd-print">🖨️ طباعة الكارت</button>
+  <style>.pt{border-collapse:collapse;font-size:13px}.pt th,.pt td{border:1px solid var(--line);padding:5px 7px;text-align:center}.pt th{background:var(--bg)}.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:6px 18px;font-size:14px;margin:12px 0}</style>
+  ${body}</div>`;
+  $('cd-back').addEventListener('click', ()=>{ cardV.itemId = ''; viewStockCard28(); });
+  $('cd-wh').addEventListener('click', ()=>{ cardV = {whId:'', itemId:'', q:''}; viewStockCard28(); });
+  $('cd-print').addEventListener('click', ()=> printSheet('كارت صنف مخزني', body));
+}
+
+/* ---------- الحركة المخزنية (إذون) ---------- */
+let vD = {type:'', kind:'', date:'', whId:'', who:'', note:'', lines:[]};
+const newVL = ()=>({item:'', qty:'', pd:'', batch:'', note:''});
+function viewStockMove28(){
+  ensureState();
+  if(!vD.date) vD.date = todayISO();
+  if(!vD.lines.length) vD.lines.push(newVL());
+  const d = vD, ro = READONLY, T = VCH[d.type], K = vkind(d.type, d.kind);
+  main.innerHTML = `<h2 class="view-title">حركة مخزنية</h2><p class="view-sub">اختار نوع الحركة (صرف / إضافة) ثم وصف الحركة، واملأ الإذن. زر «حفظ الحركة وطباعة الإذن» هو اللي بينفّذ الحركة فعليًا على الأرصدة.</p>
+  ${ro?'':`<div class="card"><div class="grid3">
+    <div class="field"><label>نوع الحركة</label>${sel('v-type',[['','— اختر —'],['out','صرف'],['in','إضافة']],d.type)}</div>
+    ${T?`<div class="field"><label>وصف الحركة</label>${sel('v-kind',[['','— اختر —']].concat(T.kinds.map(k=>[k.k,k.l])),d.kind)}</div>`:''}
+  </div>
+  ${K?`<div id="v-form" style="margin-top:12px;border-top:1px dashed var(--line-strong);padding-top:12px">
+    <div style="text-align:center;font-weight:700;font-size:17px;margin-bottom:8px">${esc(K.l)} — ${esc(T.label)}</div>
+    <div class="grid3">
+      <div class="field"><label>السيريال</label><input type="text" disabled value="${nextSerial(d.type,d.kind,true)}"></div>
+      <div class="field"><label>تاريخ الإصدار</label><input type="date" id="v-date" value="${d.date}"></div>
+      <div class="field"><label>${esc(T.whLabel)}</label>${sel('v-wh', whOpts(), d.whId||K.wh)}</div>
+      <div class="field"><label>${esc(T.who)}</label><input type="text" id="v-who" value="${escA(d.who)}"></div>
+      <div class="field" style="grid-column:span 2"><label>ملاحظات الإذن</label><input type="text" id="v-note" value="${escA(d.note)}"></div></div>
+    <div id="v-dl-wrap"></div><div class="tbl-wrap"><table id="v-tbl"><thead><tr><th>م</th><th>الصنف (كود أو اسم)</th><th>الكود</th><th>الوحدة</th>${d.type==='out'?'<th>المتاح</th>':''}<th>الكمية</th><th>تاريخ الإنتاج</th><th>رقم التشغيلة (الباتش)</th><th>ملاحظات</th><th></th></tr></thead><tbody id="v-body"></tbody></table></div>
+    <button class="btn secondary small" id="v-add" type="button">+ صنف</button>
+    <div style="display:flex;gap:14px;margin-top:20px">${SIG_V.map(n=>`<div style="flex:1;text-align:center;border-top:1px solid var(--ink-soft);padding-top:5px;font-size:13px;color:var(--ink-soft)">${esc(n)}</div>`).join('')}</div>
+    <div id="v-msg" style="margin-top:10px"></div><button class="btn" id="v-save">💾 حفظ الحركة وطباعة الإذن</button></div>`:''}</div>`}
+  <div class="card"><h3>الإذون السابقة (${state.vouchers.length})</h3><div id="v-list" class="tbl-wrap"></div></div>`;
+  injectNotices(['prod']);
+  if(!ro){
+    $('v-type').addEventListener('change', e=>{ d.type = e.target.value; d.kind = ''; d.whId = ''; d.lines = [newVL()]; viewStockMove28(); });
+    if($('v-kind')) $('v-kind').addEventListener('change', e=>{ d.kind = e.target.value; d.whId = ''; d.lines = [newVL()]; viewStockMove28(); });
+    if(K){
+      const syncHdr = ()=>{ d.date = $('v-date').value; d.whId = $('v-wh').value; d.who = $('v-who').value; d.note = $('v-note').value; };
+      ['v-date','v-who','v-note'].forEach(id=> $(id).addEventListener('input', syncHdr));
+      $('v-wh').addEventListener('change', ()=>{ syncHdr(); drawVLines(); });
+      $('v-add').addEventListener('click', ()=>{ d.lines.push(newVL()); drawVLines(); });
+      $('v-save').addEventListener('click', ()=>{ syncHdr(); saveVoucher28(); });
+      d.whId = d.whId || K.wh; drawVLines();
+    }
+  }
+  drawVList();
+}
+function drawVLines(){
+  const d = vD, body = $('v-body'); if(!body) return;
+  const out = d.type==='out', wh = $('v-wh').value || d.whId, ix = sidx();
+  $('v-dl-wrap').innerHTML = itemsDL28('v-idl', p=> !out || ((ix[p.id] && (ix[p.id].wh[wh]||0)>1e-9))) + d.lines.map((l,i)=>{
+    const p = findItem(l.item); if(!out || !p) return '';
+    return `<datalist id="v-bl-${i}">${batchesOf(ix,p.id,wh).filter(b=>b.q>1e-9).map(b=>`<option value="${escA(b.batch)}">${esc((b.pd||'بدون تاريخ')+' — رصيد '+fmt(b.q))}</option>`).join('')}</datalist>`;
+  }).join('');
+  body.innerHTML = d.lines.map((l,i)=>{
+    const p = findItem(l.item); let av = '';
+    if(out && p){ const bs = batchesOf(ix,p.id,wh); av = l.batch ? fmt((bs.find(b=>b.batch===l.batch && (!l.pd || b.pd===l.pd))||{q:0}).q) : fmt((ix[p.id]&&ix[p.id].wh[wh])||0); }
+    return `<tr><td>${i+1}</td><td><input type="text" list="v-idl" data-i="${i}" data-k="item" value="${escA(l.item)}" style="min-width:210px"></td><td style="white-space:nowrap">${esc(p?(p.code||'—'):'')}</td><td>${esc(p?unitOf(p):'')}</td>${out?`<td class="tabular">${av}</td>`:''}
+    <td><input type="number" step="any" data-i="${i}" data-k="qty" value="${escA(l.qty)}" style="width:90px"></td>
+    <td><input type="date" data-i="${i}" data-k="pd" value="${escA(l.pd)}"></td>
+    <td><input type="text" ${out&&p?`list="v-bl-${i}"`:''} data-i="${i}" data-k="batch" value="${escA(l.batch)}" style="width:110px"></td>
+    <td><input type="text" data-i="${i}" data-k="note" value="${escA(l.note)}"></td>
+    <td><button class="btn danger small" data-rm="${i}" type="button">حذف</button></td></tr>`;
+  }).join('');
+  body.querySelectorAll('input[data-k]').forEach(el=>{
+    const l = d.lines[+el.dataset.i], k = el.dataset.k;
+    el.addEventListener('input', ()=>{ l[k] = el.value; });
+    if(k==='item' || (k==='batch' && out)) el.addEventListener('change', ()=>{
+      l[k] = el.value;
+      if(k==='batch' && out){ const p = findItem(l.item); if(p){ const b = batchesOf(sidx(),p.id,wh).find(x=>x.batch===l.batch && x.q>1e-9); if(b) l.pd = b.pd; } }
+      if(k==='item'){ const p = findItem(l.item); if(p) l.item = p.name; }
+      setTimeout(drawVLines, 0);
+    });
+  });
+  body.querySelectorAll('[data-rm]').forEach(b=> b.addEventListener('click', ()=>{ d.lines.splice(+b.dataset.rm,1); if(!d.lines.length) d.lines.push(newVL()); drawVLines(); }));
+}
+function saveVoucher28(){
+  const d = vD, msg = $('v-msg'), K = vkind(d.type,d.kind), T = VCH[d.type];
+  const err = t=>{ msg.innerHTML = `<div class="msg err">${esc(t)}</div>`; };
+  if(!K) return err('اختار نوع ووصف الحركة');
+  if(!d.date) return err('اكتب تاريخ الإصدار');
+  if(!whById(d.whId)) return err('اختار المخزن');
+  const src = d.lines.filter(l=>l.item || l.qty);
+  if(!src.length) return err('أضف صنف واحد على الأقل');
+  const ix = sidx(), out = d.type==='out', final = [];
+  for(const l of src){
+    const p = findItem(l.item); if(!p) return err(`الصنف "${l.item}" مش موجود كصنف مخزني`);
+    const q = num(l.qty); if(q<=0) return err(`اكتب كمية "${p.name}"`);
+    const base = {itemId:p.id, code:p.code||'', name:p.name, unit:unitOf(p), note:l.note};
+    if(out){
+      if(l.batch || l.pd){
+        const b = batchesOf(ix,p.id,d.whId).find(x=>x.batch===l.batch.trim() && (!l.pd || x.pd===l.pd));
+        if(!b || b.q < q-1e-9) return err(`رصيد "${p.name}" ${l.batch?'باتش '+l.batch:''} في المخزن ده ${fmt(b?b.q:0)} أقل من المطلوب ${fmt(q)}`);
+        b.q -= q; final.push(Object.assign({}, base, {qty:q, batch:b.batch, pd:b.pd}));
+      } else {
+        const al = allocOut(ix, p.id, d.whId, q);
+        const sh = al.find(a=>a.short); if(sh) return err(`رصيد "${p.name}" في المخزن ده غير كافي — الناقص ${fmt(sh.qty)}`);
+        al.forEach(a=> final.push(Object.assign({}, base, {qty:a.qty, batch:a.batch, pd:a.pd})));
+      }
+    } else final.push(Object.assign({}, base, {qty:q, batch:(l.batch||'').trim(), pd:l.pd||''}));
+  }
+  const serial = nextSerial(d.type, d.kind), id = uid();
+  const v = {id, type:d.type, kind:d.kind, desc:K.l, serial, date:d.date, whId:d.whId, who:d.who, note:d.note, lines:final};
+  final.forEach(l=> addMove({date:d.date, type:out?'vout':'vin', itemId:l.itemId, whId:d.whId, qty:out?-l.qty:l.qty, unitCost:0, va:false, refType:'voucher', refId:id, batch:l.batch, pd:l.pd, vt:d.type, vk:d.kind, serial, note:`${K.l} #${serial}${l.note?' — '+l.note:''}`}));
+  state.vouchers.push(v);
+  save();
+  vD = {type:d.type, kind:d.kind, date:d.date, whId:d.whId, who:'', note:'', lines:[newVL()]};
+  viewStockMove28(); toast(`تم حفظ الحركة — ${K.l} رقم ${serial} ✓`);
+  printVoucher(v);
+}
+let vFilter = '';
+function drawVList(){
+  const el = $('v-list'); if(!el) return;
+  const ro = READONLY;
+  const list = state.vouchers.slice().reverse().filter(v=>!vFilter || v.type+'|'+v.kind===vFilter);
+  const opts = [['','كل الإذون']].concat(Object.keys(VCH).flatMap(t=>VCH[t].kinds.map(k=>[t+'|'+k.k, VCH[t].label+' — '+k.l])));
+  el.innerHTML = `<div class="field" style="max-width:340px">${sel('vf',opts,vFilter)}</div>` + (list.length ? `<table><thead><tr><th>السيريال</th><th>نوع الحركة</th><th>الوصف</th><th>التاريخ</th><th>المخزن</th><th>${'الطالب'}</th><th>أصناف</th><th></th></tr></thead><tbody>${list.slice(0,100).map(v=>`<tr><td>${esc(v.serial)}</td><td>${esc(VCH[v.type].label)}</td><td>${esc(v.desc)}</td><td>${esc(v.date)}</td><td>${esc(whLabel(v.whId))}</td><td>${esc(v.who||'')}</td><td class="tabular">${v.lines.length}</td><td><button class="btn secondary small" data-vp="${v.id}">🖨️ طباعة</button> ${ro?'':`<button class="btn danger small" data-vd="${v.id}">حذف</button>`}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">لا توجد إذون</div>');
+  $('vf').addEventListener('change', e=>{ vFilter = e.target.value; drawVList(); });
+  el.querySelectorAll('[data-vp]').forEach(b=> b.addEventListener('click', ()=>{ const v = state.vouchers.find(x=>x.id===b.dataset.vp); if(v) printVoucher(v); }));
+  el.querySelectorAll('[data-vd]').forEach(b=> b.addEventListener('click', ()=>{
+    if(!confirmTwice(b)) return;
+    const v = state.vouchers.find(x=>x.id===b.dataset.vd); if(!v) return;
+    state.stockMoves = state.stockMoves.filter(m=>m.refId!==v.id);
+    state.vouchers = state.vouchers.filter(x=>x.id!==v.id);
+    const key = v.type+'|'+v.kind; if(state.counters.vch && state.counters.vch[key]===Number(v.serial)) state.counters.vch[key] -= 1;
+    save(); viewStockMove28(); toast('تم حذف الإذن وإلغاء أثره على الأرصدة');
+  }));
+}
+
+/* ---------- الوجبات ---------- */
+let mealDraft = null;
+function newMealDraft(){ const s = {}; GROUPS.forEach(([g])=>{ s[g] = {lines:[{item:'',qty:''}], blank:()=>({item:'',qty:''})}; }); return {id:'', name:'', out:'', outQty:'1', notes:'', sec:s}; }
+function mealCost(r, ix){ let t = 0; r.lines.forEach(l=>{ t += num(l.qty)*avgCost(l.itemId, ix); }); return t; }
+function viewRecipes28(){
+  ensureState();
+  if(!mealDraft) mealDraft = newMealDraft();
+  const d = mealDraft, ro = READONLY, ix = sidx();
+  main.innerHTML = `<h2 class="view-title">الوجبات</h2><p class="view-sub">الوجبة = تركيبة التصنيع: المنتج الناتج وكميات الخامات والتعبئة والأدوات/المستهلكات المطلوبة لوجبة واحدة. بتختارها في أمر الشغل.</p>
+  ${ro?'':`<div class="card"><h3>${d.id?'تعديل وجبة':'وجبة جديدة'}</h3>
+    <div class="grid3"><div class="field"><label>اسم الوجبة</label><input type="text" id="rc-name" value="${escA(d.name)}"></div>
+    <div class="field"><label>المنتج الناتج</label><input type="text" id="rc-out" list="rc-odl" value="${escA(d.out)}">${itemsDL28('rc-odl', p=>p.kind==='fg'||p.kind==='semi')}</div>
+    <div class="field"><label>كمية الناتج لوجبة واحدة</label><input type="number" step="any" id="rc-oq" value="${escA(d.outQty)}"></div></div>
+    ${GROUPS.map(([g,t])=>`<h4 style="margin:12px 0 6px;font-size:13.5px">${t}</h4>${itemsDL28('rc-dl-'+g, p=>groupOf(p)===g)}<div id="rc-l-${g}"></div><button class="btn secondary small" data-add="${g}" type="button">+ صنف</button>`).join('')}
+    <div class="field" style="margin-top:10px"><label>ملاحظات</label><input type="text" id="rc-notes" value="${escA(d.notes)}"></div>
+    <div id="rc-msg"></div><button class="btn" id="rc-save">💾 حفظ الوجبة</button> <button class="btn secondary" id="rc-clear" type="button">وجبة جديدة</button></div>`}
+  <div class="card"><h3>الوجبات (${state.recipes.length})</h3><div id="rc-list"></div></div>`;
+  if(!ro){
+    const specOf = g => [{k:'item',ph:'الصنف (كود أو اسم)',list:'rc-dl-'+g,w:'2fr'},{id:'u',ph:'الوحدة',calc:l=>{ const p = findItem(l.item); return p?unitOf(p):''; }},{k:'qty',ph:'الكمية',type:'number'}];
+    GROUPS.forEach(([g])=>{
+      linesUI('rc-l-'+g, d.sec[g], specOf(g));
+      main.querySelector(`[data-add="${g}"]`).addEventListener('click', ()=>{ d.sec[g].lines.push(d.sec[g].blank()); linesUI('rc-l-'+g, d.sec[g], specOf(g)); });
+    });
+    ['rc-name','rc-out','rc-oq','rc-notes'].forEach(id=> $(id).addEventListener('input', ()=>{ d.name = $('rc-name').value; d.out = $('rc-out').value; d.outQty = $('rc-oq').value; d.notes = $('rc-notes').value; }));
+    $('rc-clear').addEventListener('click', ()=>{ mealDraft = newMealDraft(); viewRecipes28(); });
+    $('rc-save').addEventListener('click', ()=>{
+      const msg = $('rc-msg'), op = findItem(d.out);
+      if(!d.name.trim()){ msg.innerHTML = '<div class="msg err">اكتب اسم الوجبة</div>'; return; }
+      if(!op){ msg.innerHTML = '<div class="msg err">اختار المنتج الناتج (لازم يكون صنف مخزني)</div>'; return; }
+      if(num(d.outQty)<=0){ msg.innerHTML = '<div class="msg err">اكتب كمية الناتج</div>'; return; }
+      const lines = []; let bad = '';
+      GROUPS.forEach(([g,t])=> d.sec[g].lines.forEach(l=>{
+        if(!l.item && !l.qty) return; const p = findItem(l.item);
+        if(!p) bad = `الصنف "${l.item}" مش صنف مخزني`; else if(groupOf(p)!==g) bad = `"${p.name}" مش من ${t} — حطه في القسم الصح`; else if(num(l.qty)<=0) bad = `اكتب كمية "${l.item}"`; else lines.push({itemId:p.id, qty:num(l.qty), g});
+      }));
+      if(bad){ msg.innerHTML = `<div class="msg err">${esc(bad)}</div>`; return; }
+      if(!lines.length){ msg.innerHTML = '<div class="msg err">أضف صنف واحد على الأقل</div>'; return; }
+      const rec = {id:d.id||uid(), name:d.name.trim(), outId:op.id, outQty:num(d.outQty), notes:d.notes, lines};
+      const i = state.recipes.findIndex(r=>r.id===rec.id); if(i>=0) state.recipes[i] = rec; else state.recipes.push(rec);
+      save(); mealDraft = newMealDraft(); viewRecipes28(); toast('تم حفظ الوجبة ✓');
+    });
+  }
+  const list = $('rc-list');
+  list.innerHTML = state.recipes.length ? state.recipes.map(r=>{
+    const op = itemById(r.outId), cost = mealCost(r, ix);
+    return `<div style="border:1px solid var(--line);border-radius:8px;margin-bottom:10px;overflow:hidden">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:var(--bg);font-size:13px"><span><strong>${esc(r.name)}</strong> ← ${fmt(r.outQty)} ${esc(unitOf(op))} ${esc(op?op.name:'؟')} <span class="tag">تكلفة الوجبة ${fmt(cost)}</span> <span class="tag">تكلفة الوحدة ${fmt(r.outQty?cost/r.outQty:0)}</span></span>
+    <span>${ro?'':`<button class="btn secondary small" data-re="${r.id}">تعديل</button> <button class="btn danger small" data-rd="${r.id}">حذف</button>`}</span></div>
+    ${GROUPS.map(([g,t])=>{ const L = r.lines.filter(l=>(l.g||groupOf(itemById(l.itemId)))===g); return L.length ? `<div style="padding:6px 12px 0;font-weight:600;font-size:12.5px">${t}</div><table><thead><tr><th>الصنف</th><th>الكود</th><th>الكمية</th><th>الوحدة</th></tr></thead><tbody>${L.map(l=>{ const p = itemById(l.itemId); return `<tr><td>${esc(p?p.name:'؟')}</td><td>${esc(p?(p.code||''):'')}</td><td class="tabular">${fmt(l.qty)}</td><td>${esc(unitOf(p))}</td></tr>`; }).join('')}</tbody></table>` : ''; }).join('')}</div>`;
+  }).join('') : '<div class="empty">لا توجد وجبات</div>';
+  list.querySelectorAll('[data-re]').forEach(b=> b.addEventListener('click', ()=>{
+    const r = state.recipes.find(x=>x.id===b.dataset.re), op = itemById(r.outId), nd = newMealDraft();
+    Object.assign(nd, {id:r.id, name:r.name, out:op?op.name:'', outQty:String(r.outQty), notes:r.notes||''});
+    GROUPS.forEach(([g])=>{ const L = r.lines.filter(l=>(l.g||groupOf(itemById(l.itemId)))===g).map(l=>({item:(itemById(l.itemId)||{}).name||'', qty:String(l.qty)})); if(L.length) nd.sec[g].lines = L; });
+    mealDraft = nd; viewRecipes28(); window.scrollTo(0,0);
+  }));
+  list.querySelectorAll('[data-rd]').forEach(b=> b.addEventListener('click', ()=>{
+    if(state.productions.some(x=>x.recipeId===b.dataset.rd)){ toast('الوجبة دي اتستخدمت في أوامر شغل — مينفعش تتحذف', true); return; }
+    if(!confirmTwice(b)) return;
+    state.recipes = state.recipes.filter(x=>x.id!==b.dataset.rd); save(); viewRecipes28();
+  }));
+}
+
+/* ---------- أوامر الشغل ---------- */
+let prD = {recipeId:'', meals:'1', outQty:'', engineer:'', batch:'', note:''};
+const SIG_P = ['مهندس الإنتاج','أمين المخزن','الاعتماد'];
+function workOrderHTML(p){
+  const op = itemById(p.outId);
+  const sec = GROUPS.map(([g,t])=>{ const L = p.lines.filter(l=>(l.g||groupOf(itemById(l.itemId)))===g); return L.length ? `<div style="font-weight:700;margin-top:8px">${t}</div><table class="pt"><thead><tr><th>م</th><th>الكود</th><th>الصنف</th><th>الوحدة</th><th>الكمية المصروفة</th></tr></thead><tbody>${L.map((l,i)=>{ const it = itemById(l.itemId); return `<tr><td>${i+1}</td><td>${esc(it?(it.code||''):'')}</td><td class="r">${esc(it?it.name:'؟')}</td><td>${esc(unitOf(it))}</td><td>${fmt(l.qty)}</td></tr>`; }).join('')}</tbody></table>` : ''; }).join('');
+  return `<div class="kv"><div><b>رقم أمر الشغل:</b> ${p.no}</div><div><b>التاريخ:</b> ${esc(p.date)}</div><div><b>الوجبة:</b> ${esc(p.recipeName)}</div><div><b>عدد الوجبات:</b> ${fmt(p.batches)}</div><div><b>المنتج الناتج:</b> ${esc(op?op.name:'')} — ${fmt(p.outQty)} ${esc(unitOf(op))}</div><div><b>رقم التشغيلة:</b> ${esc(p.batch||'')}</div><div><b>مهندس الإنتاج:</b> ${esc(p.engineer||'')}</div></div>${sec}${p.note?`<div><b>ملاحظات:</b> ${esc(p.note)}</div>`:''}${sigBlock(SIG_P)}`;
+}
+function viewProduction28(){
+  ensureState(); ensureStockAccounts();
+  const d = prD, ro = READONLY, today = todayISO();
+  main.innerHTML = `<h2 class="view-title">أوامر الشغل</h2><p class="view-sub">اختار الوجبة وعدد الوجبات. عند الإصدار بيتم صرف الخامات والتعبئة والأدوات تلقائيًا من المخازن (الأقدم أولًا)، وتتسجل تكلفتها في الحسابات، وبيوصل إشعار لأمين المخزن.</p>
+  ${ro?'':`<div class="card"><h3>أمر شغل جديد</h3>
+    <div class="grid3"><div class="field"><label>التاريخ (تاريخ اليوم)</label><input type="date" id="pr-date" value="${today}" disabled></div>
+    <div class="field"><label>الوجبة</label>${sel('pr-rec',[['','— اختار الوجبة —']].concat(state.recipes.map(r=>[r.id,r.name])),d.recipeId)}</div>
+    <div class="field"><label>عدد الوجبات (يحدده مهندس الإنتاج)</label><input type="number" step="any" id="pr-b" value="${escA(d.meals)}"></div>
+    <div class="field"><label>مهندس الإنتاج</label><input type="text" id="pr-eng" value="${escA(d.engineer)}"></div>
+    <div class="field"><label>رقم التشغيلة (الباتش) — اختياري</label><input type="text" id="pr-batch" value="${escA(d.batch)}" placeholder="يتولد تلقائيًا"></div>
+    <div class="field"><label>الناتج الفعلي (اختياري)</label><input type="number" step="any" id="pr-oq" value="${escA(d.outQty)}" placeholder="لو مختلف عن المخطط"></div>
+    <div class="field" style="grid-column:span 3"><label>ملاحظة</label><input type="text" id="pr-note" value="${escA(d.note)}"></div></div>
+    <div id="pr-prev"></div><div id="pr-msg"></div><button class="btn" id="pr-save">📨 إصدار أمر الشغل وإرسال إشعار إلى المخازن</button></div>`}
+  <div class="card"><h3>أوامر الشغل السابقة (${state.productions.length})</h3><div id="pr-list" class="tbl-wrap"></div></div>`;
+  const calc = ()=>{
+    const r = state.recipes.find(x=>x.id===d.recipeId); if(!r) return null;
+    const ix = sidx(), n = num(d.meals), planned = r.outQty*n, actual = num(d.outQty)>0 ? num(d.outQty) : planned;
+    const lines = r.lines.map(l=>{ const p = itemById(l.itemId), need = l.qty*n, wh = itemWh(p), have = (ix[l.itemId]&&ix[l.itemId].wh[wh])||0, avg = avgOf(ix[l.itemId]); return {p, g:l.g||groupOf(p), need, wh, have, avg, val:need*avg}; });
+    const mat = lines.reduce((s,l)=>s+l.val,0);
+    return {r, n, planned, actual, lines, mat, unit: actual>0 ? mat/actual : 0, short: lines.filter(l=>l.have < l.need-1e-9)};
+  };
+  const drawPrev = ()=>{
+    const el = $('pr-prev'); if(!el) return;
+    const c = calc(); if(!c){ el.innerHTML = ''; return; }
+    el.innerHTML = GROUPS.map(([g,t])=>{ const L = c.lines.filter(l=>l.g===g); return L.length ? `<div style="font-weight:700;margin-top:8px">${t}</div><table><thead><tr><th>الصنف</th><th>الوحدة</th><th>المطلوب</th><th>المتاح</th><th>التكلفة</th></tr></thead><tbody>${L.map(l=>`<tr><td>${esc(l.p?l.p.name:'؟')}</td><td>${esc(unitOf(l.p))}</td><td class="tabular">${fmt(l.need)}</td><td class="tabular" style="${l.have<l.need-1e-9?'color:#A63D2F;font-weight:700':''}">${fmt(l.have)}</td><td class="tabular">${fmt(l.val)}</td></tr>`).join('')}</tbody></table>` : ''; }).join('') +
+    `<div style="margin-top:8px;font-weight:700">تكلفة الخامات والتعبئة: ${fmt(c.mat)} — الناتج ${fmt(c.actual)} — تكلفة الوحدة ${fmt(c.unit)}</div>
+    ${c.short.length?`<div class="msg err">⚠️ نقص في الرصيد: ${esc(c.short.map(l=>l.p.name).join('، '))}</div>`:''}`;
+  };
+  if(!ro){
+    const sync = ()=>{ d.recipeId = $('pr-rec').value; d.meals = $('pr-b').value; d.outQty = $('pr-oq').value; d.engineer = $('pr-eng').value; d.batch = $('pr-batch').value; d.note = $('pr-note').value; };
+    ['pr-rec','pr-b','pr-oq','pr-eng','pr-batch','pr-note'].forEach(id=> $(id).addEventListener('input', ()=>{ sync(); drawPrev(); }));
+    drawPrev();
+    $('pr-save').addEventListener('click', function(){
+      sync(); const msg = $('pr-msg'), c = calc();
+      if(!c){ msg.innerHTML = '<div class="msg err">اختار الوجبة</div>'; return; }
+      if(c.n<=0 || c.actual<=0){ msg.innerHTML = '<div class="msg err">اكتب عدد الوجبات</div>'; return; }
+      if(!d.engineer.trim()){ msg.innerHTML = '<div class="msg err">اكتب اسم مهندس الإنتاج</div>'; return; }
+      if(c.short.length && !confirmTwice(this)){ msg.innerHTML = `<div class="msg err">⚠️ في نقص رصيد في: ${esc(c.short.map(l=>l.p.name).join('، '))}. اضغط تاني لو عايز تكمل (الرصيد هيبقى بالسالب).</div>`; return; }
+      const date = todayISO(), op = itemById(c.r.outId), id = uid(), cost = {}, ix = sidx();
+      const no = (state.counters.production = (state.counters.production||0)+1);
+      const batch = d.batch.trim() || (date.replace(/-/g,'')+'-'+no);
+      const used = [];
+      c.lines.forEach(l=>{
+        const al = allocOut(ix, l.p.id, l.wh, l.need);
+        al.forEach(a=> addMove({date, type:'prod_out', itemId:l.p.id, whId:l.wh, qty:-a.qty, unitCost:l.avg, refType:'production', refId:id, batch:a.batch, pd:a.pd, note:`أمر شغل #${no} — ${c.r.name}`}));
+        used.push({itemId:l.p.id, qty:l.need, unitCost:r4(l.avg), g:l.g});
+        const v = r2(l.val); if(v>0){ const a = KINDS[l.p.kind].acc; cost[a] = (cost[a]||0)+v; }
+      });
+      const total = Object.keys(cost).reduce((s,k)=>s+cost[k],0);
+      addMove({date, type:'prod_in', itemId:op.id, whId:itemWh(op), qty:c.actual, unitCost:c.unit, refType:'production', refId:id, batch, pd:date, note:`أمر شغل #${no} — ${c.r.name}`});
+      const e = total>0 ? mkEntry(date, `أمر شغل #${no} — ${c.r.name}`, [{code:KINDS[op.kind].acc, debit:total, credit:0}].concat(groupToLines(cost,'credit')), 'P'+no, {prodFor:id}) : null;
+      state.productions.push({id, no, date, recipeId:c.r.id, recipeName:c.r.name, outId:op.id, outQty:c.actual, batches:c.n, batch, engineer:d.engineer.trim(), materialCost:r2(c.mat), unitCost:r4(c.unit), note:d.note, entryId:e?e.id:'', lines:used});
+      pushNotice('prod', `أمر شغل رقم ${no} — ${c.r.name} × ${fmt(c.n)} وجبة (تشغيلة ${batch}) — مهندس الإنتاج: ${d.engineer.trim()} — تم صرف الخامات والتعبئة والأدوات تلقائيًا`, 'P'+no);
+      save(); prD = {recipeId:'', meals:'1', outQty:'', engineer:d.engineer, batch:'', note:''}; viewProduction28();
+      toast(`تم إصدار أمر الشغل #${no} وإرسال إشعار للمخازن ✓`);
+      printSheet('أمر شغل رقم '+no, workOrderHTML(state.productions[state.productions.length-1]));
+    });
+  }
+  const list = $('pr-list');
+  list.innerHTML = state.productions.length ? `<table><thead><tr><th>#</th><th>التاريخ</th><th>الوجبة</th><th>عدد الوجبات</th><th>الناتج</th><th>التشغيلة</th><th>مهندس الإنتاج</th><th>تكلفة الخامات</th><th>تكلفة الوحدة</th><th></th></tr></thead><tbody>${state.productions.slice().reverse().map(p=>{ const op = itemById(p.outId); return `<tr><td>${p.no}</td><td>${esc(p.date)}</td><td>${esc(p.recipeName)}</td><td class="tabular">${fmt(p.batches)}</td><td class="tabular">${fmt(p.outQty)} ${esc(unitOf(op))} ${esc(op?op.name:'')}</td><td>${esc(p.batch||'')}</td><td>${esc(p.engineer||'')}</td><td class="tabular">${fmt(p.materialCost)}</td><td class="tabular">${fmt(p.unitCost)}</td><td><button class="btn secondary small" data-pp="${p.id}">🖨️</button> ${ro?'':`<button class="btn danger small" data-pd="${p.id}">حذف</button>`}</td></tr>`; }).join('')}</tbody></table>` : '<div class="empty">لا توجد أوامر شغل</div>';
+  list.querySelectorAll('[data-pp]').forEach(b=> b.addEventListener('click', ()=>{ const p = state.productions.find(x=>x.id===b.dataset.pp); if(p) printSheet('أمر شغل رقم '+p.no, workOrderHTML(p)); }));
+  list.querySelectorAll('[data-pd]').forEach(b=> b.addEventListener('click', ()=>{
+    if(!confirmTwice(b)) return;
+    const p = state.productions.find(x=>x.id===b.dataset.pd);
+    state.entries = state.entries.filter(e=>e.id!==p.entryId);
+    state.productions = state.productions.filter(x=>x.id!==p.id);
+    state.notices = state.notices.filter(n=>n.ref!=='P'+p.no);
+    save(); viewProduction28();
+  }));
+}
+
+/* ---------- الجرد ---------- */
+let stD = {date:'', wh:'', counted:{}};
+const SIG_S = ['مسؤول الحسابات','أمين المخزن','مدير المخازن','الاعتماد'];
+function stocktakeHTML(s){
+  const rows = s.lines.map((l,i)=>{ const p = itemById(l.itemId); return `<tr><td>${i+1}</td><td>${esc(p?(p.code||''):'')}</td><td class="r">${esc(p?p.name:'؟')}</td><td>${esc(unitOf(p))}</td><td>${fmt(l.system)}</td><td>${fmt(l.counted)}</td><td style="${Math.abs(l.diff)>1e-9?'font-weight:700':''}">${fmt(l.diff)}</td></tr>`; }).join('');
+  return `<div class="kv"><div><b>المخزن:</b> ${esc(whLabel(s.whId))}</div><div><b>تاريخ الجرد:</b> ${esc(s.date)}</div><div><b>عدد الأصناف المجرودة:</b> ${s.lines.length}</div></div>
+  <table class="pt"><thead><tr><th>م</th><th>الكود</th><th>الصنف</th><th>الوحدة</th><th>رصيد البرنامج</th><th>الجرد الفعلي</th><th>الفرق</th></tr></thead><tbody>${rows}</tbody></table>${sigBlock(SIG_S)}`;
+}
+function viewStocktake28(){
+  ensureState(); ensureStockAccounts();
+  if(!stD.date) stD.date = todayISO();
+  if(!stD.wh || !whById(stD.wh)) stD.wh = state.warehouses[0].id;
+  const d = stD, ix = sidx(), ro = READONLY;
+  const items = cardItemsOf(d.wh, ix);
+  const sysOf = p => (ix[p.id]&&ix[p.id].wh[d.wh])||0;
+  const draftLines = ()=> items.filter(p=>{ const c = d.counted[p.id]; return c!==undefined && c!==''; }).map(p=>{ const sys = sysOf(p), c = num(d.counted[p.id]); return {itemId:p.id, system:sys, counted:c, diff:r4(c-sys)}; });
+  main.innerHTML = `<h2 class="view-title">الجرد</h2><p class="view-sub">اكتب الكمية الفعلية اللي عدّيتها. الصنف اللي تسيبه فاضي مش بيتجرد. الفروق بتتسوّى بقيد تلقائي على "عجز وزيادة جرد المخزون" وبتتوزع على الباتشات.</p>
+  <div class="card"><div class="grid3"><div class="field"><label>المخزن</label>${sel('st-wh',whOpts(),d.wh)}</div><div class="field"><label>تاريخ الجرد</label><input type="date" id="st-date" value="${d.date}"></div></div>
+  <div class="tbl-wrap"><table><thead><tr><th>الكود</th><th>الصنف</th><th>الوحدة</th><th>رصيد البرنامج</th><th>الجرد الفعلي</th><th>الفرق</th></tr></thead><tbody>${items.map(p=>{ const sys = sysOf(p), c = d.counted[p.id]; const diff = (c===undefined||c==='') ? '' : num(c)-sys; return `<tr><td>${esc(p.code||'')}</td><td>${esc(p.name)}</td><td>${esc(unitOf(p))}</td><td class="tabular">${fmt(sys)}</td><td><input type="number" step="any" data-c="${p.id}" value="${c===undefined?'':escA(c)}" style="width:110px" ${ro?'disabled':''}></td><td class="tabular" id="sd-${p.id}" style="${diff!==''&&Math.abs(diff)>1e-9?'color:#A63D2F;font-weight:700':''}">${diff===''?'':fmt(diff)}</td></tr>`; }).join('') || '<tr><td colspan="6" class="empty">لا توجد أصناف في المخزن ده</td></tr>'}</tbody></table></div>
+  <div id="st-msg"></div>${ro?'':`<button class="btn" id="st-save">✅ اعتماد الجرد وتسوية الفروق</button>`} <button class="btn secondary" id="st-print" type="button">🖨️ طباعة تقرير الجرد</button></div>
+  <div class="card"><h3>الجرد السابق</h3><div id="st-list" class="tbl-wrap"></div></div>`;
+  $('st-wh').addEventListener('change', e=>{ d.wh = e.target.value; d.counted = {}; viewStocktake28(); });
+  $('st-date').addEventListener('input', e=>{ d.date = e.target.value; });
+  main.querySelectorAll('[data-c]').forEach(el=> el.addEventListener('input', ()=>{
+    d.counted[el.dataset.c] = el.value;
+    const p = itemById(el.dataset.c), t = $('sd-'+el.dataset.c), sys = sysOf(p);
+    t.textContent = el.value==='' ? '' : fmt(num(el.value)-sys);
+    t.style.cssText = (el.value!=='' && Math.abs(num(el.value)-sys)>1e-9) ? 'color:#A63D2F;font-weight:700' : '';
+  }));
+  $('st-print').addEventListener('click', ()=>{
+    const L = draftLines(); if(!L.length){ $('st-msg').innerHTML = '<div class="msg err">اكتب كمية فعلية لصنف واحد على الأقل</div>'; return; }
+    printSheet('تقرير جرد مخزني', stocktakeHTML({whId:d.wh, date:d.date, lines:L}));
+  });
+  if(!ro) $('st-save').addEventListener('click', ()=>{
+    const msg = $('st-msg'), L = draftLines();
+    if(!L.length){ msg.innerHTML = '<div class="msg err">اكتب كمية فعلية لصنف واحد على الأقل</div>'; return; }
+    const id = uid(), g = {}, adj = L.filter(l=>Math.abs(l.diff)>1e-9), ix2 = sidx();
+    let net = 0;
+    adj.forEach(l=>{
+      const p = itemById(l.itemId), avg = avgCost(p.id, ix2), a = KINDS[p.kind].acc;
+      if(l.diff<0){
+        allocOut(ix2, p.id, d.wh, -l.diff).forEach(x=> addMove({date:d.date, type:'adjust', itemId:p.id, whId:d.wh, qty:-x.qty, unitCost:avg, refType:'stocktake', refId:id, batch:x.batch, pd:x.pd, note:'تسوية جرد'}));
+      } else {
+        const bs = batchesOf(ix2, p.id, d.wh), last = bs.length ? bs[bs.length-1] : {batch:'', pd:''};
+        addMove({date:d.date, type:'adjust', itemId:p.id, whId:d.wh, qty:l.diff, unitCost:avg, refType:'stocktake', refId:id, batch:last.batch, pd:last.pd, note:'تسوية جرد'});
+      }
+      const v = r2(l.diff*avg); g[a] = (g[a]||0)+v; net += v;
+    });
+    let eid = '';
+    if(Math.abs(net)>0.004 || Object.keys(g).some(k=>Math.abs(g[k])>0.004)){
+      const lns = []; Object.keys(g).forEach(a=>{ if(g[a]>0) lns.push({code:a, debit:g[a], credit:0}); else if(g[a]<0) lns.push({code:a, debit:0, credit:-g[a]}); });
+      const ds = lns.reduce((s,l)=>s+l.debit,0), cs = lns.reduce((s,l)=>s+l.credit,0);
+      if(cs>ds) lns.push({code:'540007', debit:cs-ds, credit:0}); else if(ds>cs) lns.push({code:'540007', debit:0, credit:ds-cs});
+      eid = mkEntry(d.date, `تسوية جرد — ${whName(d.wh)}`, lns, '', {stFor:id}).id;
+    }
+    state.stocktakes.push({id, date:d.date, whId:d.wh, entryId:eid, lines:L});
+    save(); stD = {date:d.date, wh:d.wh, counted:{}}; viewStocktake28(); toast(`تم اعتماد الجرد — ${adj.length} صنف فيه فروق ✓`);
+  });
+  const list = $('st-list');
+  list.innerHTML = state.stocktakes.length ? `<table><thead><tr><th>التاريخ</th><th>المخزن</th><th>أصناف مجرودة</th><th>أصناف فيها فرق</th><th>الحسابات</th><th></th></tr></thead><tbody>${state.stocktakes.slice().reverse().map(s=>`<tr><td>${esc(s.date)}</td><td>${esc(whLabel(s.whId))}</td><td class="tabular">${s.lines.length}</td><td class="tabular">${s.lines.filter(l=>Math.abs(l.diff)>1e-9).length}</td><td>${s.sentAt?`<span class="tag">أُرسل ${esc(s.sentAt)}</span>`:'—'}</td><td><button class="btn secondary small" data-sp="${s.id}">🖨️ طباعة</button> ${ro?'':`<button class="btn small" data-ss="${s.id}">📤 إرسال للحسابات</button> <button class="btn danger small" data-sd="${s.id}">حذف</button>`}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">لا يوجد جرد سابق</div>';
+  list.querySelectorAll('[data-sp]').forEach(b=> b.addEventListener('click', ()=>{ const s = state.stocktakes.find(x=>x.id===b.dataset.sp); if(s) printSheet('تقرير جرد مخزني', stocktakeHTML(s)); }));
+  list.querySelectorAll('[data-ss]').forEach(b=> b.addEventListener('click', ()=>{
+    const s = state.stocktakes.find(x=>x.id===b.dataset.ss); if(!s) return;
+    s.sentAt = todayISO();
+    pushNotice('acc', `تقرير جرد ${whName(s.whId)} بتاريخ ${s.date} — ${s.lines.length} صنف، ${s.lines.filter(l=>Math.abs(l.diff)>1e-9).length} فيها فروق — مرسل من المخازن لإدارة الحسابات`, 'S'+s.id);
+    save(); viewStocktake28(); toast('تم إرسال تقرير الجرد لإدارة الحسابات ✓');
+  }));
+  list.querySelectorAll('[data-sd]').forEach(b=> b.addEventListener('click', ()=>{
+    if(!confirmTwice(b)) return;
+    const s = state.stocktakes.find(x=>x.id===b.dataset.sd);
+    state.entries = state.entries.filter(e=>e.id!==s.entryId);
+    state.notices = state.notices.filter(n=>n.ref!=='S'+s.id);
+    state.stocktakes = state.stocktakes.filter(x=>x.id!==s.id); save(); viewStocktake28();
+  }));
+}
+
 const VIEWS = {
   home:viewHome, products:viewProducts, warehouses:viewWarehouses, invBalances:viewBalances, stockCard:viewStockCard,
   stockMove:viewStockMove, recipes:viewRecipes, production:viewProduction, stocktake:viewStocktake,
+  products:viewProducts28, warehouses:viewWarehouses28, invBalances:viewBalances28, stockCard:viewStockCard28, stockMove:viewStockMove28, recipes:viewRecipes28, production:viewProduction28, stocktake:viewStocktake28,
   salesReturn:()=>viewReturn('sale'), purchaseReturn:()=>viewReturn('purchase'), suppliers:viewSuppliers, purchaseReports:viewPurchaseReports,
   whatsapp:viewWhatsapp, backup:viewBackup, printSettings:viewPrintSettings
 };
+{ const _vh = VIEWS.home; VIEWS.home = function(){ _vh(); try{ injectNotices([...(canModule('inventory')?['prod']:[]), ...(canModule('accounts')?['acc']:[])]); }catch(e){ console.error(e); } }; }
 const _origRenderInner = window.renderInner;
 window.renderInner = function(){
   ensureState();
@@ -4279,7 +5072,7 @@ function buildReport(id, param){
   }
   if(id==='stock'){
     const ix = sidx(), rows = []; let t = 0;
-    trackedItems().sort((a,b)=>a.name.localeCompare(b.name,'ar')).forEach(p=>{ const o = ix[p.id]; if(!o || Math.abs(o.q)<1e-9) return; const v = o.q*avgOf(o); t += v; rows.push([p.name, KINDS[p.kind].label, fmt(o.q)+' '+unitOf(p), fmt(avgOf(o)), fmt(v)]); });
+    trackedItems().sort((a,b)=>a.name.localeCompare(b.name,'ar')).forEach(p=>{ const o = ix[p.id]; if(!o || (Math.abs(o.q)<1e-9 && Math.abs(o.v)<0.005)) return; const v = o.v; t += v; rows.push([p.name, KINDS[p.kind].label, fmt(o.q)+' '+unitOf(p), fmt(avgOf(o)), fmt(v)]); });
     rows.push(['الإجمالي','','','',fmt(t)]);
     return {title:'أرصدة المخازن', sections:[{h:'', cols:['الصنف','النوع','الكمية','التكلفة','القيمة'], rows}]};
   }
@@ -4388,7 +5181,7 @@ function checkSchedules(){
 }
 
 /* ---- النسخ الاحتياطي ---- */
-const BK_FIELDS = ['company','logo','logo2','counters','accounts','products','customerInfo','warehouses','recipes','contacts','schedules','entries','salesInvoices','purchaseInvoices','salesOrders','salesReturns','stockMoves','productions','stocktakes','purchaseReturns','ordersSeeded','invoicesSeeded','importedFromExcel','importedBatch2','importedSeptUpdate'];
+const BK_FIELDS = ['company','logo','logo2','counters','accounts','products','customerInfo','warehouses','recipes','contacts','schedules','entries','salesInvoices','purchaseInvoices','salesOrders','salesReturns','stockMoves','vouchers','notices','productions','stocktakes','purchaseReturns','ordersSeeded','invoicesSeeded','importedFromExcel','importedBatch2','importedSeptUpdate'];
 function backupPayload(){
   const o = {app:'ledger', version:27, at:new Date().toISOString(), data:{}};
   BK_FIELDS.forEach(k=>{ o.data[k] = state[k]; });
@@ -4792,6 +5585,7 @@ const COLS = [
   {col:'contacts',        label:'جهة اتصال', key:i=>i.id, desc:i=>i.name||'', pr:3},
   {col:'schedules',       label:'جدولة تقرير', key:i=>i.id, desc:i=>i.report||'', pr:3},
   {col:'customerInfo',    label:'بيانات عميل', map:true, desc:i=>(accountByCode(i.__k)||{}).name||i.__k, pr:3},
+  {col:'vouchers',       label:'إذن مخزني', key:i=>i.id, desc:i=>`${i.desc||''} ${i.serial||''}`, pr:4},
   {col:'stockMoves',      label:'حركة مخزنية', key:i=>i.id, desc:i=>`${i.note||i.type||''} ${fmt(i.qty)}`, pr:4}
 ];
 const SCALARS = [['company','اسم الشركة'],['ui','إعدادات المظهر']];
